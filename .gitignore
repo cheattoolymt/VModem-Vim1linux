@@ -11,8 +11,10 @@ build-*/
 *.ilk
 
 # クラッシュダンプ
-core
-core.*
+# 先頭の "/" は必須。"core" と書くと src/core/ ディレクトリごと無視され、
+# src/core/*.c がコミットから漏れる (実際に漏れていた)。
+/core
+/core.*
 *.stackdump
 
 # 実行時に生成されるもの
