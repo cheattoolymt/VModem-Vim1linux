@@ -19,6 +19,29 @@
  *   よって必ず本物のヘッダを使い、動的リンク (import library) にする。
  * ===========================================================================
  */
+/*
+ * ===========================================================================
+ * Step 6 (Linux 移植) で必要になった機能テストマクロ
+ * ===========================================================================
+ * ★どの #include より先に定義しなければ効かない★
+ *
+ * _GNU_SOURCE が必要な理由:
+ *   <dlfcn.h> の RTLD_DEFAULT / RTLD_NOLOAD は POSIX ではなく GNU 拡張。
+ *   -std=c99 では __STRICT_ANSI__ が立ち、_DEFAULT_SOURCE も無効化される
+ *   ため、これらのマクロが見えず
+ *       error: 'RTLD_DEFAULT' undeclared
+ *   になる。Step 6-b の dlsym 実装はこれらに依存するので必須。
+ *
+ * _GNU_SOURCE は _POSIX_C_SOURCE 200809L を含意するので、
+ * vm_nat.c のように _POSIX_C_SOURCE を別途定義する必要はない
+ * (両方定義しても矛盾しないが、重複定義の警告を避けるため片方だけにする)。
+ *
+ * Windows ビルドでは完全に無害 (MinGW は _GNU_SOURCE を無視する)。
+ */
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#  define _GNU_SOURCE 1
+#endif
+
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,6 +68,51 @@ const vm_nat_backend_ops_t *vm_nat_ops_slirp(void)
 
 #include <libslirp.h>
 
+/* ==========================================================================
+ * ★難所 7 / Step 6-c★ poll 抽象と「fd を入れる型」の隔離
+ * ==========================================================================
+ * Windows と POSIX で違うのは関数名だけではない。
+ *
+ *   型      : WSAPOLLFD.fd は SOCKET (UINT_PTR, Win64 では 8 バイト)
+ *             struct pollfd.fd は int (4 バイト)
+ *   戻り値  : WSAPoll は SOCKET_ERROR、poll は -1 (値は同じ -1 だが
+ *             エラーの取り出しが WSAGetLastError() と errno で違う)
+ *   空リスト: WSAPoll(fds, 0, t) は WSAEINVAL、poll(NULL, 0, t) は sleep
+ *   EINTR   : POSIX にしか存在しない (Step 6-c で対応)
+ *
+ * ここで型と呼び出しを 1 箇所に閉じ込め、以降のコードから
+ * Winsock 固有の型名 (WSAPOLLFD / SOCKET / INVALID_SOCKET) が
+ * 一切出てこないようにする。これが Step 6-c の要求「Winsock 型の除去」
+ * の実体である。**Linux 側の翻訳単位には winsock の識別子が
+ * 1 つも現れてはならない**。
+ *
+ * 【Step 6-c の監査結果 (機械的に検証した)】
+ *   指示書の要求は「WSAPOLLFD / SOCKET / INVALID_SOCKET 等が
+ *   #ifdef _WIN32 で正しく隔離されているか確認」である。
+ *   目視ではなくプリプロセッサ出力で確認した:
+ *
+ *     gcc -std=c99 -Iinclude -Isrc/net -DVMODEM_HAVE_LIBSLIRP \
+ *         -E src/net/vm_nat_slirp.c |
+ *       grep -E 'WSAPOLLFD|INVALID_SOCKET|WSAPoll|UINT_PTR|SOCKET_ERROR|
+ *                GetProcAddress|GetModuleHandle|closesocket|
+ *                WSAGetLastError|\bSOCKET\b'
+ *     → 一致 0 件
+ *
+ *   つまり Linux ビルドの翻訳単位からは Winsock 由来の識別子が
+ *   完全に消えている。隔離されている箇所は以下の 4 つだけ:
+ *
+ *     1. この poll 抽象ブロック
+ *        (WSAPOLLFD / WSAPoll / POLL* 定数の補完)
+ *     2. VM_SLIRP_HAVE_SOCKET_API == 0 時の vm_slirp_socket_t 補完
+ *        (Windows 側だけ UINT_PTR を使う)
+ *     3. slirp_to_native()          … Step 6-a で完全分離
+ *     4. cb_add_poll_fd()           … UINT_PTR キャストは _WIN32 内のみ
+ *
+ *   ★残っている唯一の「Windows 語」は libslirp.h 自身が
+ *     公開している slirp_os_socket 型だが、これは libslirp が
+ *     Linux では `int` に typedef するので問題無い
+ *     (include/libslirp.h の #ifdef _WIN32 分岐)。
+ */
 #ifdef _WIN32
 #  ifndef POLLIN
      /* WSAPoll の定数は winsock2.h にあるが古い SDK では欠ける */
@@ -63,7 +131,7 @@ const vm_nat_backend_ops_t *vm_nat_ops_slirp(void)
 #else
 #  include <poll.h>
 #  include <errno.h>
-#  include <time.h>          /* struct timespec / nanosleep (下の sleep 分岐) */
+#  include <dlfcn.h>         /* Step 6-b: dlsym / RTLD_DEFAULT */
    typedef struct pollfd vm_pollfd_t;
 #  define VM_POLL(fds, n, to) poll((fds), (nfds_t)(n), (int)(to))
 #endif
@@ -156,9 +224,78 @@ const vm_nat_backend_ops_t *vm_nat_ops_slirp(void)
  *   ここを落とすと修正そのものが無効化される。
  *   version 2 は libslirp 4.1 以降の全バージョンに存在するため、
  *   フォールバック先として安全。
+ *
+ * ===========================================================================
+ * ★★★ Step 6-b: 「POSIX なら遅延束縛で助かる」は誤りだった ★★★
+ * ===========================================================================
+ * 移植前のコードは POSIX 側でこう書いていた:
+ *
+ *     #elif VM_SLIRP_HAVE_SOCKET_API
+ *         // POSIX では ELF の遅延束縛のおかげで Windows のような
+ *         // 起動時全滅は起きない。ヘッダが新しければそのまま使う。
+ *         g_slirp_abi.fill_socket = slirp_pollfds_fill_socket;
+ *
+ * これは **リンク時に落ちる**。実際に再現させた:
+ *
+ *   $ gcc ... -DVMODEM_HAVE_LIBSLIRP src/net/vm_nat_slirp.c ... -lslirp
+ *   /usr/bin/ld: vm_nat_slirp.c:(.text+0x7b3): undefined reference to
+ *                `slirp_pollfds_fill_socket'
+ *   collect2: error: ld returned 1 exit status
+ *
+ * 【なぜ遅延束縛では救われないのか】
+ *   遅延束縛 (lazy binding) が効くのは「シンボルは存在するが、
+ *   呼ばれるまで解決を遅らせる」場合であって、
+ *   **シンボルが共有ライブラリに存在しない場合は静的リンク段階で
+ *   即エラーになる**。ld は -lslirp の .dynsym を読み、
+ *   未定義参照が埋まらない事をその場で検出する。
+ *   (--allow-shlib-undefined を付けても、今度は実行時に
+ *    「symbol lookup error」でプロセスが起動しない。Windows と同じ結末)
+ *
+ * 【なぜこれが Linux 移植で必ず問題になるのか】
+ *   apt で入る libslirp は Ubuntu Noble / Debian Trixie ともに **4.8.0**。
+ *   このバージョンには当該シンボルが存在しない。実測:
+ *
+ *   $ nm -D --defined-only /usr/lib/x86_64-linux-gnu/libslirp.so.0.4.0 \
+ *       | grep fill
+ *   slirp_pollfds_fill@@SLIRP_4.0        ← 旧 API だけ
+ *   (slirp_pollfds_fill_socket は無い)
+ *
+ *   一方、本リポジトリが同梱する include/libslirp.h は 4.9.3 なので
+ *   SLIRP_CHECK_VERSION(4,9,0) が真になり、上のコードが有効化される。
+ *   → **apt の libslirp では絶対にビルドが通らない**。
+ *   指示書は「ソースから 4.9.1 を入れる」方針だが、そこで失敗した
+ *   利用者が apt に戻した瞬間にビルドが壊れるのは受け入れられない。
+ *
+ * 【対策 (Windows の GetProcAddress と 1:1 対応させる)】
+ *   dlsym(RTLD_DEFAULT, "slirp_pollfds_fill_socket") で **実行時に**
+ *   解決する。静的な参照が消えるのでリンクは常に通り、
+ *   4.8 では NULL が返って旧 API へフォールバックする。
+ *
+ *   RTLD_DEFAULT を使う理由:
+ *     プロセスに既にロード済みの全オブジェクトを既定の順序で検索する。
+ *     libslirp は -lslirp で静的にリンクされて既にロードされているので、
+ *     ここで新たに dlopen する必要が無い
+ *     (Windows 側で GetModuleHandleA を使い LoadLibrary を避けたのと
+ *      全く同じ理屈)。実測でこの方式だけが動く事を確認した:
+ *
+ *       dlopen("libslirp.so.0", RTLD_LAZY|RTLD_NOLOAD) → NULL
+ *         (SONAME が違う / dlopen 経由でロードされていないため)
+ *       dlsym(RTLD_DEFAULT, "slirp_version_string")    → 有効なアドレス
+ *       dlsym(RTLD_DEFAULT, "slirp_pollfds_fill")      → 有効なアドレス
+ *       dlsym(RTLD_DEFAULT, "slirp_pollfds_fill_socket") → NULL (4.8 なので)
+ *
+ *     ★注意★ RTLD_DEFAULT は libslirp が実際にリンクされている
+ *     プロセスでのみ有効。libslirp を全く参照していない実行ファイル
+ *     (例: リンクだけ試すテスト) では 3 つとも NULL になるが、
+ *     その場合はそもそも slirp バックエンドを使えないので問題ない。
+ *
+ *   -ldl が必要 (Makefile.linux は Step 7 で用意する。指示書の
+ *    LDFLAGS に -ldl が入っているのはこのため)。
+ *   なお glibc 2.34 以降は libdl が libc に統合されたので
+ *   -ldl は無害な no-op になる (VIM1 の Noble は glibc 2.39)。
  */
 
-/* GetProcAddress で解決する関数の型 (ヘッダの宣言に依存しない形で持つ) */
+/* 動的解決する関数の型 (ヘッダの宣言に依存しない形で自前で持つ) */
 typedef void (*vm_fill_socket_fn)(Slirp *slirp, uint32_t *timeout,
                                   SlirpAddPollSocketCb add_poll, void *opaque);
 
@@ -204,6 +341,7 @@ typedef struct {
 
     uint64_t      poll_calls;
     uint64_t      timer_fires;
+    uint64_t      poll_eintr;   /* Step 6-c: poll() が EINTR で戻った回数 */
 
     /* ---- ★難所 9★ outbound_addr の実体 ---- */
     /*
@@ -321,19 +459,79 @@ static void slirp_probe_abi(void)
             break;
         }
     }
-#elif VM_SLIRP_HAVE_SOCKET_API
+#else
     /*
-     * POSIX では ELF の遅延束縛のおかげで Windows のような
-     * 起動時全滅は起きない。ヘッダが新しければそのまま使う。
+     * ★Step 6-b の実装★ POSIX 版の GetProcAddress = dlsym。
+     *
+     * ここで **絶対に slirp_pollfds_fill_socket を名前で直接
+     * 参照してはいけない**。参照した時点でリンカが未定義シンボルを
+     * 検出し、apt の libslirp 4.8 ではビルドが通らなくなる。
+     * (上のコメントに再現ログを載せた通り)
+     *
+     * ヘッダのバージョンで #if 分岐する必要も無い。文字列で引くので
+     * ヘッダが 4.8 でも 4.9 でも同じコードが正しく動く。
+     * これは Windows 側が「ヘッダに関係なく GetProcAddress で引く」
+     * のと完全に対称であり、両 OS で同じ判断ロジックになる。
      */
-    g_slirp_abi.fill_socket = slirp_pollfds_fill_socket;
+    {
+        /*
+         * 関数ポインタと void* の相互キャストは C 標準 (6.3.2.3) では
+         * 未定義だが、POSIX.1-2008 は dlsym の戻り値をこう使う事を
+         * 明示的に要求している (dlsym の RATIONALE 参照)。
+         * -Wpedantic を黙らせるため union 経由にする。
+         *   (POSIX 自身が推奨している回避策)
+         */
+        union {
+            void             *ptr;
+            vm_fill_socket_fn fn;
+        } u;
+
+        u.ptr = dlsym(RTLD_DEFAULT, "slirp_pollfds_fill_socket");
+        g_slirp_abi.fill_socket = u.fn;   /* 無ければ NULL = 旧 API */
+
+        /*
+         * ★dlsym が失敗した理由は区別しなくてよい★
+         * 「libslirp が 4.8 だからシンボルが無い」と
+         * 「dlsym 自体が使えない」の区別は付かないが、どちらでも
+         * 取るべき行動 (旧 API へのフォールバック) は同じ。
+         * dlerror() は呼ばない: 呼ぶとエラーキューを消費するため、
+         * 他のライブラリの dlerror() 診断を壊す可能性がある。
+         */
+    }
 #endif
 
-    VM_LOGI("nat(slirp): DLL バージョン %s (cfg.version 上限=%u, "
-            "fill_socket=%s)",
+    /*
+     * ログ表記を OS 中立にする。
+     * Linux では "DLL" ではなく共有ライブラリなので、
+     * 実機のログを読む人が混乱しないよう言い分ける。
+     */
+    VM_LOGI("nat(slirp): libslirp %s を検出 "
+#ifdef _WIN32
+            "(DLL)"
+#else
+            "(共有ライブラリ)"
+#endif
+            " cfg.version 上限=%u, fill=%s",
             (ver != NULL) ? ver : "不明",
             (unsigned)g_slirp_abi.cfg_version_max,
-            (g_slirp_abi.fill_socket != NULL) ? "新API" : "旧API(int切り詰め)");
+            (g_slirp_abi.fill_socket != NULL)
+                ? "slirp_pollfds_fill_socket (新API)"
+                : "slirp_pollfds_fill (旧API・fd は int に切り詰められる)");
+
+    /*
+     * ★Linux 固有の注意喚起★
+     * 旧 API でも Linux の fd は int なので切り詰めの害は無い
+     * (害があるのは SOCKET が 8 バイトの Win64 だけ)。
+     * その事を明記しないと、実機ログを見た人が
+     * 「旧 API だから繋がらないのか」と誤った方向に調査を始める。
+     */
+#ifndef _WIN32
+    if (g_slirp_abi.fill_socket == NULL) {
+        VM_LOGI("nat(slirp): 旧 API を使うが Linux の fd は int なので "
+                "切り詰めの問題は起きない (apt の libslirp 4.8 は "
+                "slirp_pollfds_fill_socket を持たないため正常な経路)");
+    }
+#endif
 
     /*
      * ヘッダと DLL が食い違っていたら警告する。
@@ -427,7 +625,65 @@ static void slirp_probe_abi(void)
  *
  *   SLIRP_POLL_PRI (TCP 緊急データ = OOB) は Windows では POLLRDBAND に
  *   相当するので、そちらへマップする。POLLRDBAND は events に指定可能。
+ *
+ * ===========================================================================
+ * ★★★ Step 6-a: この関数を Linux と Windows で完全に分ける ★★★
+ * ===========================================================================
+ * 指示書 Step 6-a の要求は
+ *   「WSAPoll 専用フィルタ (slirp_to_native()) が Linux 側に
+ *     影響しないか確認」
+ * である。**確認した結果、影響していた。** 移植前のこの関数は
+ * #ifdef _WIN32 が PRI の 1 行だけに掛かっており、
+ * 「ERR / HUP を落とす」という **Windows のためだけの制約が
+ *  POSIX ビルドにもそのまま適用されていた**。
+ *
+ * 【なぜ POSIX で ERR / HUP を落としてはいけないのか】
+ *
+ * poll(2) の規格上、events に立てなくても revents には
+ * POLLERR / POLLHUP / POLLNVAL が返る。ここまでは移植前のコメントの
+ * 通りで、「取りこぼしは発生しない」も **正しい**。
+ * だが問題は revents ではなく **「そもそも poll が起きるか」** である。
+ *
+ *   POSIX poll(2):
+ *     "If none of the defined events have occurred on any selected
+ *      file descriptor, poll() shall wait at least timeout milliseconds"
+ *
+ * つまり revents に何が返るかとは別に、Linux カーネルの poll 実装は
+ * 「要求された events に対応する条件が揃ったら起こす」という形で
+ * wait queue の起床条件を決める。ソケットに対しては
+ * (net/socket.c の sock_poll → tcp_poll 等)
+ * エラー・切断状態は常に mask に載るので実際には起床するが、
+ * これは **実装の詳細に依存した幸運**であり、規格が保証するのは
+ * 「events で要求した条件」だけである。
+ *
+ * より本質的な理由は 2 つある:
+ *
+ *   (1) events が空になる場合の意味が変わる
+ *       libslirp は接続中 TCP に対して
+ *           add_poll(so->s, SLIRP_POLL_OUT | SLIRP_POLL_ERR, ..)
+ *       を要求する (src/slirp.c:865)。移植前の変換では OUT が残るので
+ *       これは無事だが、libslirp が将来 ERR 単独を要求すると
+ *       native == 0 になり、下の add_poll_common が「仕方なく POLLIN を
+ *       立てる」という **意味の違うイベント**にすり替えていた。
+ *       接続失敗の検出が POLLIN 待ちに化けるという致命的な誤りである。
+ *
+ *   (2) デバッグ時に「libslirp が何を待っているか」が消える
+ *       ERR/HUP を落とすと、poll のダンプを見ても libslirp の意図が
+ *       分からない。Step 6 以降で「繋がらない」を追う時、
+ *       これは調査時間を無駄に伸ばす。
+ *
+ * 【結論】
+ *   POSIX 版は libslirp が要求した通りに全ビットを渡す。これは
+ *   QEMU の net/slirp.c (slirp_poll_to_gio) が
+ *       IN/OUT/PRI/ERR/HUP を **すべて** G_IO_* に変換している
+ *   のと同じ方針であり、libslirp が想定している唯一の正しい使い方。
+ *   Windows 版は WSAPoll の制約があるため従来のフィルタを維持する。
+ *
+ *   ★重要★ この関数から「Windows のための都合」を Linux 側へ
+ *   漏らさない事が Step 6-a の成果物である。
  */
+#ifdef _WIN32
+
 static int slirp_to_native(int ev)
 {
     int r = 0;
@@ -440,13 +696,8 @@ static int slirp_to_native(int ev)
      *   Windows: POLLPRI は使用禁止。POLLRDBAND が OOB 相当で events 可。
      *            なお POLLIN は (POLLRDNORM|POLLRDBAND) なので、
      *            SLIRP_POLL_IN が既に立っていれば実質含まれている。
-     *   POSIX  : POLLPRI をそのまま使う。
      */
-#ifdef _WIN32
     if (ev & SLIRP_POLL_PRI) r |= POLLRDBAND;
-#else
-    if (ev & SLIRP_POLL_PRI) r |= POLLPRI;
-#endif
 
     /*
      * ★ SLIRP_POLL_ERR / SLIRP_POLL_HUP は意図的に無視する ★
@@ -456,6 +707,31 @@ static int slirp_to_native(int ev)
 
     return r;
 }
+
+#else  /* POSIX (Linux / Khadas VIM1) */
+
+static int slirp_to_native(int ev)
+{
+    int r = 0;
+
+    if (ev & SLIRP_POLL_IN)  r |= POLLIN;
+    if (ev & SLIRP_POLL_OUT) r |= POLLOUT;
+    if (ev & SLIRP_POLL_PRI) r |= POLLPRI;
+
+    /*
+     * ★ここが Windows と決定的に違う★
+     * poll(2) は events の POLLERR / POLLHUP を無視するだけで
+     * エラーを返さない。libslirp が要求した意図を保つため素直に渡す。
+     * (POLLNVAL は「fd が不正」という出力専用の意味しか持たないので
+     *  events には立てない。libslirp も要求してこない)
+     */
+    if (ev & SLIRP_POLL_ERR) r |= POLLERR;
+    if (ev & SLIRP_POLL_HUP) r |= POLLHUP;
+
+    return r;
+}
+
+#endif /* _WIN32 */
 
 /*
  * revents -> SLIRP_POLL_* の逆変換。
@@ -765,15 +1041,51 @@ static int add_poll_common(slirp_os_socket fd, int events, void *opaque)
     native = slirp_to_native(events);
 
     /*
-     * ★ events が空になるケースの防御 ★
-     * libslirp が SLIRP_POLL_ERR だけを要求してくると、上の変換で
-     * native == 0 になる。WSAPoll に events == 0 のエントリを渡すと
-     * 実装によっては WSAEINVAL を返すので、最低限 POLLIN を立てる。
-     * (エラーは events に関係なく revents で通知されるため、
-     *  POLLIN を余分に立てても意味的な破綻は無い)
+     * ★ events が空になるケースの扱い (Step 6-c) ★
+     *
+     * ここは移植前は OS 共通で
+     *     if (native == 0) native = POLLIN;
+     * だった。**これは Windows のための細工であり、POSIX では有害**。
+     *
+     * 【Windows】
+     *   slirp_to_native() が ERR / HUP を落とすので、libslirp が
+     *   SLIRP_POLL_ERR だけを要求すると native == 0 になり得る。
+     *   WSAPoll に events == 0 のエントリを渡すと実装によっては
+     *   WSAEINVAL を返して poll 全体が即死するため、
+     *   ダミーとして POLLIN を立てる必要がある。
+     *   エラーは events に関係なく revents に載る (MSDN 明記) ので
+     *   取りこぼしは起きない。
+     *
+     * 【POSIX】
+     *   Step 6-a で slirp_to_native() が全ビットを素通しするように
+     *   なったため、libslirp が非 0 の events を要求している限り
+     *   native == 0 には **ならない**。仮に libslirp が events == 0 を
+     *   要求してきたなら、それは「この fd では起床しなくてよい (revents で
+     *   エラーだけ拾う)」という意味であり、poll(2) はそれを正しく扱う
+     *   (events == 0 でも POLLERR/POLLHUP/POLLNVAL は revents に返る)。
+     *   ここで勝手に POLLIN を立てると
+     *     - libslirp の意図と違う「読み取り可能待ち」にすり替わる
+     *     - 読めるデータがある fd で poll が即戻りして busy loop になる
+     *   という二重の劣化を招く。よって **何もしない** のが正しい。
      */
+#ifdef _WIN32
     if (native == 0)
-        native = POLLIN;
+        native = POLLIN;        /* WSAPoll(events == 0) 回避のダミー */
+#else
+    /*
+     * POSIX: 意図的に補正しない。
+     * ただし「events == 0 が来た」という事実は繋がらない時の
+     * 手掛かりになるので、一度だけ記録しておく。
+     */
+    if (native == 0) {
+        static int warned_once = 0;
+        if (!warned_once) {
+            warned_once = 1;
+            VM_LOGW("nat(slirp): libslirp が events==0 で fd を登録した "
+                    "(slirp_events=0x%x)。revents のエラー通知のみ有効", events);
+        }
+    }
+#endif
 
     idx = si->nfds++;
     si->fds[idx].fd      = fd;
@@ -1049,6 +1361,56 @@ static vm_err_t slirp_be_open(vm_nat_t *n)
      *   **ダイアルアップ確立より前**に呼ばれる。
      *   まだ RAS の経路が入っていないので GetBestRoute が実 NIC を返す。
      *   (念のため vm_hostroute 側でも IF_TYPE_PPP を弾いている)
+     *
+     * ======================================================================
+     * ★★★ Step 6-c: Linux での outbound_addr 再検証 ★★★
+     * ======================================================================
+     * 上の説明は全て Windows / RAS を前提にしている。Linux では前提が
+     * 違うので、「同じコードのままで害が無いか」を実測で確認した。
+     *
+     * 【前提の違い】
+     *   - Linux に RAS は無い。デフォルト経路を奪うのは
+     *     pppd の `defaultroute` オプションだが、本実装は pppd を使わず
+     *     PPP を自前で処理するので、経路表は一切触られない。
+     *     → 自己参照ループは原理的に起きない。
+     *   - Linux の IPv4 は既定で **weak host model**
+     *     (net.ipv4.conf.*.rp_filter とは別の話)。送信元アドレスを
+     *     bind しても出力インタフェースは経路表で決まる。
+     *     → bind は「送信元 IP の固定」であって
+     *        「出力 IF の固定」ではない。Windows と意味が違う。
+     *
+     * 【つまり Linux では outbound_addr は必要か】
+     *   必要ではない。しかし **有害でもない**。むしろ VIM1 に
+     *   有線 eth0 と Wi-Fi wlan0 が両方生きている場合に送信元を
+     *   安定させる効果があるので、そのまま有効にしておく。
+     *
+     * 【実測で確認した 3 点】
+     *   (1) 実 NIC の IP への bind() は成功する。
+     *   (2) 存在しない IP (192.168.77.55) への bind() は
+     *       errno 99 = EADDRNOTAVAIL で失敗する。
+     *       → NIC の IP が DHCP で変わった後や、USB gadget を
+     *          抜き差しして IF が消えた後も libslirp は古い
+     *          outbound_addr を持ち続ける (ポインタ保持なので
+     *          si->outbound を書き換えれば追従はできるが、
+     *          既存ソケットは作り直されない)。
+     *          症状は「全ての新規接続が即エラー」。
+     *          切り分けは `strace -e trace=bind` か、
+     *          si->outbound の中身をログで確認する事。
+     *   (3) NIC の IP に bind した UDP ソケットから
+     *       127.0.0.1 へ sendto しても応答が返る
+     *       (Linux は loopback 宛を weak host model で通す)。
+     *       → outbound_addr を設定しても、libslirp が
+     *          vnameserver 宛 DNS を host の 127.0.0.53
+     *          (systemd-resolved) へ中継する経路は壊れない。
+     *          これは Linux 移植で最も壊れそうな箇所だったが、
+     *          実測で問題無しと確認できた。
+     *
+     * 【Linux で「繋がらない」時に見る順番】
+     *   1. si->outbound_valid と bind 先 IP がログに出ているか
+     *   2. `ip route get 8.8.8.8` の src がその IP と一致するか
+     *      (一致しないなら bind が経路と矛盾している)
+     *   3. 一致しないなら vm_hostroute_pick_outbound_ip() の
+     *      connect(2) プローブが別 IF を選んでいる
      * ====================================================================== */
     {
         char     ifname[128];
@@ -1131,9 +1493,34 @@ static void slirp_be_close(vm_nat_t *n)
     if (si == NULL)
         return;
 
-    VM_LOGI("nat(slirp): 終了 poll=%llu timer_fires=%llu",
+    /*
+     * ★Step 6-c: timer_fires == 0 は正常★
+     *
+     * 指示書は「インターネットに出られない時は timer_fires を確認せよ」と
+     * 書いているが、**この構成では timer_fires は 0 のままが正常**である。
+     * libslirp が timer_new を呼ぶ箇所は upstream 全体で 1 つだけで、
+     *
+     *   src/ip6_icmp.c  icmp6_post_init()
+     *       if (!slirp->in6_enabled) {
+     *           return;                      ← ここで即 return
+     *       }
+     *       slirp->ra_timer = slirp_timer_new(slirp, SLIRP_TIMER_RA, NULL);
+     *
+     * つまり **IPv6 Router Advertisement 専用**。
+     * 本実装は IPV6CP を Reject して cfg.in6_enabled = false にしている
+     * ので、タイマは 1 つも作られない。4.8.0 / master 双方で確認済み。
+     *
+     * したがって切り分けは
+     *   timer_fires == 0 かつ poll > 0        → 正常。別の原因を疑う
+     *   poll == 0                             → poll ループまで来ていない
+     *   eintr が poll と同オーダーで増える    → シグナル嵐 (Step 6-c の罠)
+     * と読む。
+     */
+    VM_LOGI("nat(slirp): 終了 poll=%llu timer_fires=%llu eintr=%llu"
+            " (timer_fires=0 は IPv6 無効時の正常値)",
             (unsigned long long)si->poll_calls,
-            (unsigned long long)si->timer_fires);
+            (unsigned long long)si->timer_fires,
+            (unsigned long long)si->poll_eintr);
 
     if (si->slirp != NULL)
         slirp_cleanup(si->slirp);
@@ -1224,6 +1611,74 @@ static int slirp_be_poll(vm_nat_t *n, int max_block_ms)
     /* ---- 段 2: 実際に待つ ---- */
     if (si->nfds > 0) {
         rc = VM_POLL(si->fds, si->nfds, (int)timeout);
+
+#ifndef _WIN32
+        /*
+         * ================================================================
+         * ★★★ Step 6-c: EINTR の扱い (Linux 固有の致命的な罠) ★★★
+         * ================================================================
+         * Windows の WSAPoll に EINTR は存在しない。よって移植前の
+         * コードには EINTR の処理が無く、そのまま Linux に持ち込むと
+         * **シグナルが 1 発届くだけで通信が壊れる**。
+         *
+         * 【なぜ Linux では必ず起きるのか】
+         *   src/main.c の install_signal_handlers() は
+         *       sa.sa_flags = 0;            ← SA_RESTART を付けない
+         *   としている。これは意図的で、SA_RESTART を付けると
+         *   シリアル読取の read() が自動再開してしまい、Ctrl-C の反応が
+         *   タイムアウト (200ms) 分遅れるため。
+         *   その代償として、シグナル配送中に走っていた poll() は
+         *       return -1, errno == EINTR
+         *   で戻ってくる。SIGWINCH や SIGCHLD、プロファイラの SIGPROF、
+         *   デバッガの停止/再開など、SIGINT 以外でも普通に起きる。
+         *
+         * 【EINTR を放置すると何が起きるか】
+         *   rc < 0 のまま段 3 に進むと select_error = 1 になる。
+         *   libslirp 側は
+         *       if (!select_error) { ... 全ソケットの受信処理 ... }
+         *   でガードしているので、**その周回のソケット I/O が丸ごと
+         *   スキップされる**。送信 (slirp_input 経由) だけは動くため、
+         *   症状は「時々パケットを取りこぼす / 転送が固まる」となり、
+         *   原因が極めて分かりにくい。
+         *
+         * 【対策】
+         *   EINTR は「何も起きていない」= タイムアウトと等価に扱う。
+         *   ここで poll をやり直すのではなく rc = 0 にするのが正しい:
+         *     - 呼び出し元 (vm_modem.c) は 20ms ごとに poll する
+         *       ポーリングループなので、待ち時間が短くなるのは無害。
+         *     - 逆にループで再試行すると、終了シグナルを受けた時に
+         *       ここから抜け出せず、Ctrl-C が効かなくなる
+         *       (SA_RESTART を付けないという main.c の設計と矛盾する)。
+         *   revents は poll が -1 を返した時点で未定義なので、
+         *   全エントリをゼロクリアしてから段 3 に渡す。
+         *
+         * EAGAIN / ENOMEM も「今回は諦めて次周回」で足りるが、
+         * こちらは select_error として libslirp に伝える価値があるので
+         * そのまま rc < 0 で通す (ログには残す)。
+         */
+        if (rc < 0 && errno == EINTR) {
+            int i;
+            for (i = 0; i < si->nfds; i++)
+                si->fds[i].revents = 0;
+            si->poll_eintr++;
+            rc = 0;             /* タイムアウトと同一視 */
+        } else if (rc < 0) {
+            /*
+             * EINTR 以外の失敗。ここに来るのは
+             *   EFAULT (fds が不正 = 我々のバグ)
+             *   EINVAL (nfds > RLIMIT_NOFILE)
+             *   ENOMEM
+             * のいずれか。復旧できないので select_error として伝え、
+             * 無音で止まらないようにログを出す (最初の 1 回だけ)。
+             */
+            static int warned_poll_fail = 0;
+            if (!warned_poll_fail) {
+                warned_poll_fail = 1;
+                VM_LOGE("nat(slirp): poll() が失敗した (errno=%d, nfds=%d)。"
+                        "以降このメッセージは抑制する", errno, si->nfds);
+            }
+        }
+#endif /* !_WIN32 */
     } else {
         /*
          * 監視対象が無い。poll(NULL, 0, t) は POSIX では単なる sleep だが
