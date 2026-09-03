@@ -30,8 +30,8 @@ Windows 版は com0com の仮想 COM ペアを「電話線」に使っていま�
 
 ## 移植の進捗
 
-本リポジトリは移植手順書 (`linux_port_instructions.md`) の **Step 0〜4 のみ**を
-実装した段階です。**Step 5 以降は意図的に未着手**です。
+本リポジトリは移植手順書 (`linux_port_instructions.md`) の **Step 0〜5 のみ**を
+実装した段階です。**Step 6 以降は意図的に未着手**です。
 
 | Step | 内容 | 状態 |
 |---|---|---|
@@ -40,22 +40,27 @@ Windows 版は com0com の仮想 COM ペアを「電話線」に使っていま�
 | 2 | `src/audio/vm_audio_alsa.c` (ALSA 音声出力) | ✅ 完了 |
 | 3 | `src/main.c` のシグナル処理 | ✅ 完了 |
 | 4 | `src/core/vm_log.c` の POSIX 対応 | ✅ 完了 |
-| 5 | `src/net/vm_nat.c` / `vm_hostroute_linux.c` / `vm_nat_slirp.c` | ⬜ 未着手 |
-| 6 | `Makefile.linux` | ⬜ 未着手 |
-| 7 | `scripts/setup-gadget-linux.sh` (USB Gadget 設定) | ⬜ 未着手 |
-| 8 | `windows/vim1modem.inf` (XP 用 INF) | ⬜ 未着手 |
+| 5 | `src/net/vm_nat.c` の時計 / `vm_hostroute_linux.c` (新規) | ✅ 完了 |
+| 6 | `src/net/vm_nat_slirp.c` (libslirp の POSIX 対応) | ⬜ 未着手 |
+| 7 | `Makefile.linux` | ⬜ 未着手 |
+| 8 | `scripts/setup-gadget-linux.sh` / `windows/vim1modem.inf` | ⬜ 未着手 |
 
 Step 3・4 が入ったので、**libslirp を使わない構成 (`--net none` /
 `--net loopback`) なら Linux 上で実際に起動・常駐・正常終了できます**。
-Windows 依存の残りは `src/net/` に閉じており、それが Step 5 の範囲です。
-`--net slirp` はまだ Windows 前提のコード (`GetProcAddress` /
-`GetTickCount64` / `WSAPOLLFD`) を含むため Step 5 が必要です。
+Step 5 で `src/net/` の Windows 依存のうち **時計 (`GetTickCount64`) と
+外向きアドレスの検出 (`GetAdaptersAddresses`)** が解消されました。
+`--net slirp` にはまだ `GetProcAddress` / `WSAPOLLFD` 前提のコードが
+`vm_nat_slirp.c` に残っているため、**Step 6 が必要**です。
 
 ```bash
-# Step 4 までで動く構成の例 (PTY をモデム側の回線として使う)
+# Step 5 までで動く構成の例 (PTY をモデム側の回線として使う)
+#
+# ★ vm_hostroute.c ではなく vm_hostroute_linux.c を渡すこと ★
+#   (Step 5 の要求。詳細は下の「Step 5」節を参照。なお両方渡しても
+#    vm_hostroute.c は _WIN32 で囲まれているのでリンクは通ります)
 gcc -O2 -std=c99 -Iinclude \
     src/core/*.c src/dsp/*.c src/modem/*.c \
-    src/net/vm_eth.c src/net/vm_hdlc.c src/net/vm_hostroute.c \
+    src/net/vm_eth.c src/net/vm_hdlc.c src/net/vm_hostroute_linux.c \
     src/net/vm_nat.c src/net/vm_nat_loopback.c src/net/vm_nat_slirp.c \
     src/net/vm_ppp.c src/net/vm_winsock.c \
     src/audio/vm_audio.c src/audio/vm_audio_null.c src/audio/vm_audio_alsa.c \
@@ -397,21 +402,215 @@ off += snprintf(line + off, sizeof(line) - off, ...);
 
 ---
 
+## Step 5: NAT の時計と外向きアドレス検出
+
+Step 5 の成果物は 3 つです。**`vm_nat_slirp.c` 本体の移植 (Step 6) には
+手を付けていません。**
+
+| 対象 | 変更 |
+|---|---|
+| `src/net/vm_nat.c` | `GetTickCount64()` → `clock_gettime(CLOCK_MONOTONIC)` |
+| `src/net/vm_hostroute_linux.c` | **新規**。`getifaddrs()` による外向き IPv4 の検出 |
+| `src/net/vm_hostroute.c` | Linux ビルドから除外 (翻訳単位ごと `_WIN32` で囲む) |
+
+### 5-1: なぜ `CLOCK_MONOTONIC` でなければならないのか
+
+`vm_nat_now_ns()` は libslirp に `cb_clock_get_ns` として渡される
+**唯一の時計**で、TCP の再送タイマ・DHCP のリース期限・ARP キャッシュの
+寿命がすべてここに乗ります。候補を検討した結果は以下の通りです。
+
+| 候補 | 採否 | 理由 |
+|---|---|---|
+| `CLOCK_REALTIME` | ✗ | NTP や `date` で**巻き戻る**。巻き戻った瞬間に libslirp は「まだ時間が経っていない」と判断し、再送が止まって接続が固まる。**VIM1 は RTC バックアップ電池を持たないため、起動直後の時刻は必ず狂っており、NTP 同期で必ず大きく飛ぶ** |
+| `CLOCK_MONOTONIC_RAW` | ✗ | NTP の周波数補正を受けないため、実時間と最大 500ppm ずれる。Linux 固有で移植性も低い |
+| `CLOCK_BOOTTIME` | △ | サスペンド中も進む。VIM1 は常時通電なので差は出ないが、`CLOCK_MONOTONIC` より対応環境が狭い |
+| `CLOCK_MONOTONIC` | ✅ | 巻き戻らず、NTP の周波数補正は受ける。POSIX 標準 |
+
+Windows 側も同時に改善しました。`GetTickCount64()` の分解能は
+**15.6ms** (タイマ割り込み周期) しかなく、libslirp の 100ms 単位の
+タイマ判定には粗すぎます。`QueryPerformanceCounter` を第一候補にし、
+取得に失敗した時だけ `GetTickCount64()` に落とします。
+
+なお ns への換算は
+`sec * 1e9 + (rem * 1e9) / freq` と**商と余りに分けて**計算しています。
+`count * 1000000000 / freq` と素朴に書くと、QPC の周波数が 10MHz の
+環境で **約 29 年でオーバーフロー**しますが、それ以前に
+`count * 1000000000` が 64bit を溢れて即座に破綻します。
+
+### 5-2: 失敗時に 0 を返してはいけない
+
+`clock_gettime` が失敗する状況はほぼありませんが、失敗時に 0 を返すと
+libslirp から見て時刻が起動直後に巻き戻り、**全てのタイマが即発火する**
+という最悪の壊れ方をします。そこで `last_ns + 1ms` を返して
+「僅かに進んだ」ことにし、`VM_LOGE` は**初回だけ**出します
+(毎回出すとログが溢れて本当の原因が埋もれます)。
+
+さらに最終防衛線として、返す直前に `now_ns < last_ns` なら
+`last_ns` に切り上げます。これは「巻き戻らない」という libslirp が
+依存する不変条件を、時計の実装に関係なく関数の出口で保証するためです。
+
+### 5-a: 外向きアドレスの検出 (`vm_hostroute_linux.c`)
+
+Windows 版と**同じインタフェース** (`vm_hostroute.h`) を実装するので、
+呼び出し側 (`vm_nat_slirp.c`) を `#ifdef` で分岐させる必要がありません。
+これは libslirp の `SlirpConfig.outbound_addr` に渡す値で、
+存在しないアドレスを渡すと `slirp_bind_outbound()` の `bind()` が
+`EADDRNOTAVAIL` で落ち、**外向き接続が全滅**します
+(実際に `bind()` で `EADDRNOTAVAIL(99)` を再現して確認しました)。
+
+検出方法として 3 案を比較しました。
+
+| 方法 | 採否 | 理由 |
+|---|---|---|
+| `/proc/net/route` の解析 | ✗ | テキスト形式に依存。IPv6 やポリシールーティング (`ip rule`) を考慮できない |
+| rtnetlink を手書き | ✗ | 最も正確だが数百行になる。Step 5 の範囲に対して過大 |
+| `connect()` + `getsockname()` | ✅ | **カーネルの経路表そのものに聞く**ので、ポリシールーティングも VPN も自動的に反映される |
+
+`SOCK_DGRAM` に対する `connect(2)` は**パケットを 1 バイトも送りません**。
+カーネル内で経路検索を行って送信元アドレスを確定するだけなので、
+`getsockname(2)` でそれを読み出せます。`8.8.8.8:53` を宛先に使いますが、
+**そこへ通信は発生しません** (名前解決も行いません)。
+
+検出は 4 段構えです。
+
+1. `connect()` 探索で候補を得る
+2. その候補が**実 NIC のもの**であることを `getifaddrs()` で照合する
+3. 照合に失敗したら、実 NIC を総当たりで走査する
+4. それでも決まらなければ **0 を返す** (= 判定不能)
+
+**0 は「失敗」ではなく仕様上正当な戻り値です。** libslirp 側は
+`outbound_addr` が NULL の時 `slirp_bind_outbound()` を no-op にするので、
+「カーネルの既定動作に任せる」という安全側に倒れます。単一 NIC の
+環境ではそもそも `outbound_addr` を設定する必要がありません。
+
+除外する対象は指示書の要求通りです。
+
+| 除外対象 | 判定方法 |
+|---|---|
+| ループバック `127.0.0.0/8` | アドレス範囲 + `IFF_LOOPBACK` |
+| APIPA `169.254.0.0/16` | アドレス範囲 (ただし後述の例外あり) |
+| PPP | `IFF_POINTOPOINT` |
+| トンネル / 仮想 NIC | IF 名の接頭辞 (`tun` `tap` `ppp` `docker` `veth` `br-` `virbr` `vnet` `wg` `tailscale` `zt` `gre` `sit` `ip6tnl` `erspan` `dummy` `usb` `rndis` `lo`) |
+| 未稼働の NIC | `IFF_UP` かつ `IFF_RUNNING` を要求 |
+
+`usb` / `rndis` を除外しているのは、**それが本エミュレータ自身の
+USB Gadget 側**だからです。ここに bind すると PC 側へ折り返す
+自己参照ループになります。
+
+#### APIPA の例外について
+
+指示書は `169.254.0.0/16` の除外を要求していますが、**カーネルの
+既定経路がその範囲のアドレスを指している環境が実在します**
+(本リポジトリの開発 sandbox がまさにそれで、`default via 169.254.0.22
+dev eth0` です)。この場合 APIPA を機械的に除外すると
+「使える唯一のアドレスを捨てて 0 を返す」ことになります。
+
+そこで段階 1〜3 では通常通り APIPA を除外し、**そこで何も決まらなかった
+時に限り**、段階 1 の候補 (= カーネル自身がグローバル向け経路として
+選んだアドレス) を実 NIC 上にあることを再確認してから採用します。
+採用時は理由をログに出すので、意図しない挙動と区別できます。
+
+```
+hostroute: 外向きアドレスに 169.254.0.21 (eth0) を採用
+           (169.254/16 だがカーネルがグローバル向け経路として
+            選んだ実 NIC なので使用可能と判断)
+```
+
+### 5-3: `vm_hostroute.c` の除外は Makefile だけでは足りない
+
+指示書は「Makefile 側で `vm_hostroute.c` を除外する」ことを要求して
+いますが、**それだけでは不十分**です。移植前の `vm_hostroute.c` は
+`_WIN32` の否定側に「常に 0 を返す POSIX スタブ」を持っていたため、
+両ファイルを同時にコンパイルすると
+
+```
+/usr/bin/ld: multiple definition of vm_hostroute_pick_outbound_ip
+             vm_hostroute_linux.c: first defined here
+```
+
+でリンクが落ちます (実際に再現させました)。上の「Step 5 までで動く構成の
+例」のように `.c` を手で並べるビルドや、`src/net/*.c` をワイルドカードで
+拾う CI では、Makefile の `SRCS` 指定は何の防御にもなりません。
+
+そこで**翻訳単位ごと `_WIN32` で囲みました**。Linux では
+`vm_hostroute.c` が外部シンボルを 1 つも定義しなくなるので、
+誤って両方渡しても衝突しません (`nm` で確認済み)。ISO C は空の翻訳
+単位を許さない (C99 6.9) ので、末尾にダミーの `typedef` を置いています。
+
+---
+
 ## 検証状況
 
-Step 1〜4 で追加・変更した翻訳単位は、警告ゼロでコンパイルできます
+Step 1〜5 で追加・変更した翻訳単位は、警告ゼロでコンパイルできます
 (`-Wall -Wextra -Wpedantic`)。
 
 ```bash
 gcc -c -O2 -std=c99 -Wall -Wextra -Wpedantic -Iinclude \
     src/serial/vm_serial.c src/serial/vm_serial_linux.c \
     src/audio/vm_audio.c src/audio/vm_audio_alsa.c src/audio/vm_audio_null.c \
-    src/core/vm_log.c src/main.c
+    src/core/vm_log.c src/main.c \
+    src/net/vm_nat.c src/net/vm_hostroute_linux.c src/net/vm_hostroute.c
+```
+
+最後の `vm_hostroute.c` は Linux では**シンボルを 1 つも生成しない**
+ことも確認済みです (Step 5-3)。
+
+```bash
+$ gcc -c -O2 -std=c99 -Wall -Wextra -Wpedantic -Iinclude \
+      src/net/vm_hostroute.c -o /tmp/hrw.o && nm /tmp/hrw.o
+$          # 出力なし = 外部シンボルなし = 重複定義が起こり得ない
 ```
 
 Step 3・4 の完了により、`--net none` / `--net loopback` 構成では
 **実行可能なバイナリが作れ、起動・常駐・正常終了まで通ります**
 (「移植の進捗」節のコマンド例を参照)。
+
+### Step 5 の新規テスト
+
+`tests/test_linux_step5.c` が Step 5・5-a の実行時検証を行います
+(**29 項目すべて成功 / 省略 0**)。
+
+```bash
+# ★ vm_hostroute.c と vm_hostroute_linux.c を意図的に両方渡す ★
+#   リンクが通ること自体が Step 5-3 (除外) の検証になっている
+gcc -O2 -std=c99 -Wall -Wextra -Iinclude tests/test_linux_step5.c \
+    src/net/vm_nat.c src/net/vm_nat_loopback.c src/net/vm_nat_slirp.c \
+    src/net/vm_eth.c src/net/vm_hostroute_linux.c src/net/vm_hostroute.c \
+    src/core/vm_log.c src/core/vm_types.c -lpthread -o test_linux_step5
+./test_linux_step5
+```
+
+外向き IP の検出結果はマシンごとに違うので、**値そのものを assert して
+いません**。代わりに「どの環境でも成り立つ性質」を検証します。
+検出できない環境 (ネットワーク未接続の CI 等) では 0 が返りますが、
+それは安全な失敗なので OK と判定し、値の検証だけを SKIP します。
+
+検証内容:
+
+| 節 | 検証する事 |
+|---|---|
+| 5-1 | 初回が正の値である事 (0 を返さない) / 連続呼び出しが非減少である事 / int64 のオーバーフロー領域に入っていない事 |
+| 5-2 | **200ms の `nanosleep` を基準時計と突き合わせ**、誤差 5ms 未満である事。ms/ns のスケール取り違えを確実に捕まえる (1000 倍ずれれば差は 200ms 級になる) |
+| 5-3 | 20 万回呼んで**最小増分が 1ms 未満**である事 = `GetTickCount64` 相当の粗い時計ではない事 |
+| 5-4 | 4 スレッド × 5 万回 = 20 万回で**一度も巻き戻らない**事 |
+| 5-a-1 | 検出した IP に**実際に `bind()` できる**事 / `getifaddrs` の一覧に存在する事 / ループバックでない事 |
+| 5-a-2 | 選ばれた NIC が仮想 NIC の接頭辞に一致しない事 / `IFF_LOOPBACK`・`IFF_POINTOPOINT` が立っていない事 / `IFF_UP` である事 |
+| 5-a-3 | 自分自身を `/32` で除外すると同じ IP を返さない事 / `exclude_mask=0` が「除外なし」として扱われる事 / `192.168.99.0/24` の除外が無関係な NIC に影響しない事 |
+| 5-a-4 | `name_out=NULL` で落ちない事 / `size=0` で**一切書き込まない**事 / 4 バイトバッファでも**前後の番兵を壊さず NUL 終端する**事 |
+| 5-a-5 | **3000 回連続で呼んで結果が変わらない**事 = 内部の `socket()` の閉じ忘れ (fd リーク) が無い事。既定の fd 上限 1024 を余裕で超える回数にしてある |
+| 5-5 | 両 hostroute ファイルが同時にリンクできた事 / IF 名が返る (= 常に 0 を返すスタブではない) 事 |
+
+実行時には答え合わせ用に `getifaddrs()` の一覧も表示します。
+
+```
+このホストの IPv4 アドレス一覧 (答え合わせ用, 2 件)
+   127.0.0.1        lo         flags=0x00010049 UP RUN LOOP
+   169.254.0.21     eth0       flags=0x00011043 UP RUN
+```
+
+Step 5 の変更が既存の NAT / PPP を壊していない事も確認済みです
+(`tests/test_nat.c` **92 項目成功**、`tests/test_linux_step34.c`
+**53 項目成功**、`tests/test_linux_port.c` **30 項目成功**)。
 
 ### Step 3・4 の新規テスト
 
@@ -429,7 +628,7 @@ Step 3 はプロセス全体の振る舞い (シグナルの配送先・終了�
 ライブラリ関数として呼び出せません。そのため**実際に vmodem を起動して
 シグナルを送り、`/proc` とログを観測する**方式を取っています。
 バイナリのパスは第 1 引数か `VMODEM_BIN` で指定し、見つからなければ
-Step 3 の節を SKIP します (ビルド系の整備は Step 6 の範囲なので、
+Step 3 の節を SKIP します (ビルド系の整備は Step 7 の範囲なので、
 テストがビルド方法を仮定しないようにしています)。
 
 検証内容:
@@ -516,7 +715,7 @@ POSIX 向けに書き直した後も**全項目そのまま成功**します。`
 `test_audio` は上流と 1 バイトも違わないファイルで、`-std=c99` 時に
 `_POSIX_C_SOURCE` が無いため `nanosleep` / `struct timespec` を解決できない
 という**既存の問題**です (上流ツリーでも同一のエラーが再現します)。
-テストとビルド系の整備は Step 6 以降の範囲なので本 PR では触っていません。
+テストとビルド系の整備は Step 7 以降の範囲なので本 PR では触っていません。
 
 ---
 
@@ -528,17 +727,22 @@ POSIX 向けに書き直した後も**全項目そのまま成功**します。`
 | OS | Armbian (Ubuntu Noble ベース) / Linux 6.12 |
 | コンパイラ | gcc 13 以降 (Armbian Noble の既定は gcc 13.2 / 13.3) |
 | 音声 | `libasound2-dev` (alsa-lib) |
-| NAT | `libslirp-dev` (Step 5 以降で使用) |
+| NAT | `libslirp-dev` (`--net slirp` 用。有効化は Step 6) |
 
 ```bash
 sudo apt install build-essential libasound2-dev libslirp-dev
 ```
 
-`Makefile.linux` は Step 6 の成果物なのでまだありません。現時点では
+`Makefile.linux` は Step 7 の成果物なのでまだありません。現時点では
 上記の `gcc` コマンドで個別にコンパイル・テストしてください。
 
+なお `libslirp-dev` を入れて `-DVMODEM_HAVE_LIBSLIRP` を付けても、現時点では
+`vm_nat_slirp.c` が `slirp_pollfds_fill_socket` (libslirp 4.9 以降の API) を
+直接参照しているため 4.8 系ではリンクが通りません。この ABI 差の吸収は
+**Step 6 の範囲**なので本段階では手を付けていません。
+
 `/dev/ttyGS0` を開くには USB Gadget の設定が必要ですが、その設定スクリプト
-(`scripts/setup-gadget-linux.sh`) も Step 7 の成果物です。実行時に権限で
+(`scripts/setup-gadget-linux.sh`) は Step 8 の成果物です。実行時に権限で
 失敗した場合は `dialout` グループへの追加、また `serial-getty@ttyGS0` が
 ポートを掴んでいる場合は無効化が必要で、エラーメッセージがその旨を案内します。
 
@@ -561,6 +765,11 @@ src/audio/
 src/dsp/                 トーン合成・V.8 / V.34 ハンドシェイク音・リサンプラ
 src/modem/               AT コマンド・接続シーケンス・全体制御
 src/net/                 PPP / HDLC / 疑似 Ethernet / NAT
+  vm_nat.c               ★NAT 共通・時計 (Step 5 で CLOCK_MONOTONIC 化)
+  vm_nat_slirp.c         libslirp バックエンド (Step 6 で移植予定・未着手)
+  vm_hostroute.c         外向きアドレス検出 Windows 版
+                         ★Step 5 で翻訳単位ごと _WIN32 で囲み Linux から除外
+  vm_hostroute_linux.c   ★Linux / getifaddrs 版 (Step 5-a)
 src/serial/
   vm_serial.c            共通処理・バックエンド振り分け
   vm_serial_win32.c      Windows (上流)
@@ -569,6 +778,7 @@ src/main.c               ★エントリポイント (Step 3 でシグナル処�
 tests/
   test_linux_port.c      ★Step 1・2 の検証
   test_linux_step34.c    ★Step 3・4 の検証
+  test_linux_step5.c     ★Step 5・5-a の検証
 docs/README-windows.md   上流 Windows 版の README (libslirp の罠など)
 ```
 

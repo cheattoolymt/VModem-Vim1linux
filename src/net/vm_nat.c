@@ -37,38 +37,122 @@
  *
  * GetTickCount() は 32bit ms なので 49.7 日で 0 に戻る。使ってはいけない。
  * QueryPerformanceCounter は単調増加が保証され、分解能も十分。
+ *
+ * ---------------------------------------------------------------------------
+ * Linux 移植 (Step 5) で加えた 3 点
+ * ---------------------------------------------------------------------------
+ * (1) なぜ CLOCK_MONOTONIC なのか / なぜ他ではないのか
+ *
+ *     CLOCK_REALTIME       : NTP や `date` で **巻き戻る**。絶対に不可。
+ *                            Khadas VIM1 には RTC バッテリがなく、起動直後は
+ *                            1970 年から始まって NTP 同期で数十年ジャンプする。
+ *                            これを渡すと libslirp のタイマが「遠い未来」に
+ *                            設定され、TCP 再送が事実上停止する。
+ *     CLOCK_MONOTONIC      : 単調増加が保証される。adjtime による周波数調整は
+ *                            受けるが**跳ばない**。← これを使う
+ *     CLOCK_MONOTONIC_RAW  : adjtime の影響すら受けないが、vDSO 経由でない
+ *                            実装ではシステムコールになり呼び出しが重い。
+ *                            我々は poll ごとに数回読むので不要な代償。
+ *     CLOCK_BOOTTIME       : サスペンド時間を含む。含めない方が正しい。
+ *                            サスペンド中は USB もリンクダウンしていて相手も
+ *                            止まっているので、復帰時に「何万 ms 経った」と
+ *                            libslirp に教えると全 TCP セッションが一斉に
+ *                            期限切れ扱いになり、無駄な RST を撒く。
+ *
+ * (2) 失敗時に 0 を返してはいけない
+ *
+ *     移植前は clock_gettime が失敗すると 0 を返していた。これは
+ *     「巻き戻り」そのもので、上に書いた無言ハングを自ら作り込む。
+ *     seccomp や壊れた vDSO で失敗しうるので、最後に読めた値から
+ *     1ms 進めた値を返して前進だけは保証する。
+ *
+ * (3) 最後の砦としての単調化 (クランプ)
+ *
+ *     どの経路を通っても「前回返した値より小さい値は返さない」。
+ *     CLOCK_MONOTONIC が仕様通りなら常に無効な保険だが、保険の costs は
+ *     比較 1 回であり、失敗した時の症状 (原因不明のハング) が
+ *     極端に重いので置く。
+ *
+ *     ★スレッド安全性について★
+ *     last_ns は排他していない。この関数を呼ぶのは
+ *       - イベントループ (vm_nat_poll -> libslirp のコールバック)
+ *       - テストコード
+ *     だけで、いずれも単一スレッドである。仮に競合しても
+ *     「どちらかの値が採用される」だけで、返る値は必ず
+ *     どちらかのスレッドが観測した実時刻以上なので破綻しない
+ *     (int64_t への代入が分割される ILP32 環境では理論上ちぎれるが、
+ *      その場合も下のクランプが単調性を回復させる)。
  */
 int64_t vm_nat_now_ns(void)
 {
+    /* 最後に返した値。単調性の最終保証に使う (上の (3))。 */
+    static int64_t last_ns = 0;
+    int64_t        now_ns;
+
 #ifdef _WIN32
-    static LARGE_INTEGER freq;
-    static int           freq_ok = 0;
-    LARGE_INTEGER        now;
-
-    if (!freq_ok) {
-        if (!QueryPerformanceFrequency(&freq) || freq.QuadPart == 0) {
-            /* 最終手段。GetTickCount64 は 64bit なので巻き戻らない。 */
-            return (int64_t)GetTickCount64() * 1000000LL;
-        }
-        freq_ok = 1;
-    }
-    QueryPerformanceCounter(&now);
-
-    /*
-     * (now * 1e9) / freq を素朴に書くと now が大きい時に桁溢れする。
-     * 秒と余りに分けて計算する。
-     */
     {
-        int64_t sec  = (int64_t)(now.QuadPart / freq.QuadPart);
-        int64_t rem  = (int64_t)(now.QuadPart % freq.QuadPart);
-        return sec * 1000000000LL + (rem * 1000000000LL) / (int64_t)freq.QuadPart;
+        static LARGE_INTEGER freq;
+        static int           freq_ok = 0;
+        LARGE_INTEGER        now;
+
+        if (!freq_ok) {
+            if (!QueryPerformanceFrequency(&freq) || freq.QuadPart == 0) {
+                /* 最終手段。GetTickCount64 は 64bit なので巻き戻らない。 */
+                now_ns = (int64_t)GetTickCount64() * 1000000LL;
+                goto clamp;
+            }
+            freq_ok = 1;
+        }
+        QueryPerformanceCounter(&now);
+
+        /*
+         * (now * 1e9) / freq を素朴に書くと now が大きい時に桁溢れする。
+         * 秒と余りに分けて計算する。
+         */
+        {
+            int64_t sec = (int64_t)(now.QuadPart / freq.QuadPart);
+            int64_t rem = (int64_t)(now.QuadPart % freq.QuadPart);
+            now_ns = sec * 1000000000LL +
+                     (rem * 1000000000LL) / (int64_t)freq.QuadPart;
+        }
     }
 #else
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
-        return 0;
-    return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+    {
+        struct timespec ts;
+
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+            now_ns = (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+        } else {
+            /*
+             * ★ここで 0 を返すと libslirp のタイマが死ぬ★ (上の (2))
+             * 前回値を 1ms 進めて「時間は必ず前に進む」ことだけを守る。
+             * 一度だけ警告する (毎回出すとログが埋まる)。
+             */
+            static bool warned = false;
+
+            if (!warned) {
+                warned = true;
+                VM_LOGE("nat: clock_gettime(CLOCK_MONOTONIC) が失敗した。"
+                        "内部カウンタで代用する (TCP 再送の精度が落ちる)");
+            }
+            now_ns = last_ns + 1000000LL;
+        }
+    }
 #endif
+
+#ifdef _WIN32
+clamp:
+#endif
+    /*
+     * ★最後の砦★ 前回より小さい値は絶対に返さない (上の (3))。
+     * 巻き戻りは libslirp のタイマ比較を反転させ、
+     * 「無言で通信が止まる」という最も切り分けにくい症状を生む。
+     */
+    if (now_ns < last_ns)
+        now_ns = last_ns;
+
+    last_ns = now_ns;
+    return now_ns;
 }
 
 /* ==========================================================================
@@ -212,9 +296,22 @@ vm_err_t vm_nat_create(vm_nat_t **out, const vm_nat_cfg_t *cfg,
              * 落とすと「なぜかインターネットに出られない」という
              * 分かりにくい状態になるので、必ず警告してエラーを返す。
              * フォールバックの判断は呼び出し側に委ねる。
+             *
+             * ★案内先は OS ごとに違う★
+             * 移植前は Windows 用の PowerShell スクリプトだけを案内して
+             * いた。Linux 利用者にそれを見せると「そんなファイルは無い」で
+             * 手が止まる。原因が同じでも対処が違うので、必ず分ける。
              */
+#ifdef _WIN32
             VM_LOGE("nat: libslirp が組み込まれていません。"
                     "scripts/setup-libslirp.ps1 を実行して再ビルドしてください");
+#else
+            VM_LOGE("nat: libslirp が組み込まれていません。"
+                    "libslirp-dev を入れて -DVMODEM_HAVE_LIBSLIRP 付きで"
+                    "再ビルドしてください "
+                    "(例: sudo apt install libslirp-dev && "
+                    "make -f Makefile.linux)");
+#endif
             free(n);
             return VM_ERR_UNSUPPORTED;
         }

@@ -1,10 +1,41 @@
 /*
- * vm_hostroute.c - ホスト側の実インターネット経路の検出
+ * vm_hostroute.c - ホスト側の実インターネット経路の検出 (Windows 版)
  *
  * SPDX-License-Identifier: BSD-2-Clause
  *
  * 設計の背景 (なぜこれが「繋がらない」の本命なのか) は
  * include/vmodem/vm_hostroute.h 冒頭を熟読すること。
+ *
+ * ===========================================================================
+ * Linux 移植 (Step 5) : このファイルは Linux ビルドから除外する
+ * ===========================================================================
+ * Linux 版の実装は src/net/vm_hostroute_linux.c にある。
+ * Makefile.linux (Step 7) の SRCS には vm_hostroute_linux.c だけを並べ、
+ * 本ファイルは含めない ── というのが指示書 Step 5 の要求である。
+ *
+ * ★しかし Makefile だけの対策では不十分である★
+ *
+ * 移植前の本ファイルは末尾に _WIN32 の否定側 (#else 側) として
+ * POSIX 版のスタブ (常に 0 を返す) を持っていた。そのため両ファイルを
+ * 同時にコンパイルすると
+ *
+ *   /usr/bin/ld: multiple definition of vm_hostroute_pick_outbound_ip
+ *                vm_hostroute_linux.c: first defined here
+ *
+ * となってリンクが落ちる (実際に再現させて確認した)。
+ * README の「Step 4 までで動く構成の例」のように .c を手で並べる
+ * ビルドや、src/net 以下をワイルドカードで拾う CI では、
+ * Makefile の SRCS 指定は何の防御にもならない。
+ *
+ * そこで **翻訳単位ごと _WIN32 で囲む**。こうすれば
+ *   - Linux で誤って両方を渡しても、本ファイルは空になり衝突しない
+ *   - どちらの実装が有効かがファイルを開いた瞬間に分かる
+ * となり、ビルド系の書き方に依存しない構造的な排他になる。
+ *
+ * ISO C は「空の翻訳単位」を許さない (C99 6.9: translation-unit には
+ * external-declaration が 1 つ以上必要) ので、-Wpedantic で
+ * 警告が出ないよう末尾にダミーの typedef を置いてある。
+ * ===========================================================================
  */
 #include <stdio.h>
 #include <string.h>
@@ -17,6 +48,11 @@
 #include "vmodem/vm_hostroute.h"
 #include "vmodem/vm_log.h"
 
+/*
+ * ここから下、実体は Windows だけ。
+ * Linux では末尾の #else 側 (ダミー typedef のみ) が有効になり、
+ * この翻訳単位は外部シンボルを 1 つも定義しない。
+ */
 #if defined(_WIN32)
 
 /*
@@ -342,19 +378,34 @@ uint32_t vm_hostroute_pick_outbound_ip(uint32_t exclude_net,
 
 #else /* !_WIN32 */
 
-uint32_t vm_hostroute_pick_outbound_ip(uint32_t exclude_net,
-                                       uint32_t exclude_mask,
-                                       char *name_out, size_t name_size)
-{
-    /*
-     * POSIX ではこの問題は起きない。
-     * Linux は weak host model で、かつ本プロジェクトの想定環境は
-     * Windows なので、何もせず 0 (= outbound_addr を使わない) を返す。
-     */
-    (void)exclude_net; (void)exclude_mask;
-    if (name_out != NULL && name_size > 0)
-        name_out[0] = '\0';
-    return 0;
-}
+/*
+ * ==========================================================================
+ * Linux / POSIX では本ファイルは **完全に空** になる (Step 5)
+ * ==========================================================================
+ * 移植前はここに「常に 0 を返す POSIX スタブ」があったが、削除した。
+ *
+ * 【なぜ削除したのか】
+ *   Step 5-a で src/net/vm_hostroute_linux.c が本物の実装
+ *   (getifaddrs + connect による検出) を提供する。スタブを残すと
+ *   同じ外部シンボル vm_hostroute_pick_outbound_ip が 2 つになり、
+ *   両ファイルをコンパイルした瞬間にリンクエラーになる。
+ *
+ * 【なぜ「スタブを残して Linux 実装を別名にする」ではないのか】
+ *   指示書 Step 5-a は「Windows 版と同じインタフェース
+ *   (vm_hostroute.h) を実装する」ことを要求している。
+ *   呼び出し側 (vm_nat_slirp.c) を #ifdef で分岐させずに済むのが
+ *   同一インタフェースの利点なので、名前は変えない。
+ *
+ * 【なぜスタブの「0 を返す」挙動を捨ててよいのか】
+ *   スタブのコメントは「POSIX ではこの問題は起きないので何もしない」
+ *   としていたが、それは Linux を対象外としていた時の判断である。
+ *   指示書 Step 5 は Linux でも outbound_addr の設定を維持せよと
+ *   明示しており、その理由は vm_hostroute_linux.c 冒頭に書いた
+ *   (VIM1 は LAN / Wi-Fi / Tailscale が同居する)。
+ *
+ * ISO C 的に空の翻訳単位は不正なので、下のダミー typedef を置く。
+ * これはコードを生成せず、-Wpedantic でも警告にならない。
+ */
+typedef int vm_hostroute_win32_only_translation_unit;
 
 #endif /* _WIN32 */
