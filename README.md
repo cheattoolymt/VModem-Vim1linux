@@ -30,8 +30,8 @@ Windows 版は com0com の仮想 COM ペアを「電話線」に使っていま�
 
 ## 移植の進捗
 
-本リポジトリは移植手順書 (`linux_port_instructions.md`) の **Step 0〜6 のみ**を
-実装した段階です。**Step 7 以降は意図的に未着手**です。
+本リポジトリは移植手順書 (`linux_port_instructions.md`) の
+**Step 0〜8 (8-a を含む) すべて**を実装した段階です。
 
 | Step | 内容 | 状態 |
 |---|---|---|
@@ -42,8 +42,8 @@ Windows 版は com0com の仮想 COM ペアを「電話線」に使っていま�
 | 4 | `src/core/vm_log.c` の POSIX 対応 | ✅ 完了 |
 | 5 | `src/net/vm_nat.c` の時計 / `vm_hostroute_linux.c` (新規) | ✅ 完了 |
 | 6 | `src/net/vm_nat_slirp.c` (libslirp の POSIX 対応) | ✅ 完了 |
-| 7 | `Makefile.linux` | ⬜ 未着手 |
-| 8 | `scripts/setup-gadget-linux.sh` / `windows/vim1modem.inf` | ⬜ 未着手 |
+| 7 | `Makefile.linux` | ✅ 完了 |
+| 8 | `scripts/setup-gadget-linux.sh` / `windows/vim1modem.inf` | ✅ 完了 |
 
 Step 3・4 が入ったので、**libslirp を使わない構成 (`--net none` /
 `--net loopback`) なら Linux 上で実際に起動・常駐・正常終了できます**。
@@ -702,8 +702,12 @@ ttyGS0 の代役にしています (master 側が「Windows の RAS」、slave �
 test_at  test_core  test_dsp  test_resample  test_sequence  test_ppp  test_nat   → 7/7 PASS
 test_linux_port (Step 1・2)                                                       → 30/30 PASS
 test_linux_step34 (Step 3・4)                                                     → 53/53 PASS
-test_audio                                                                       → ビルド不可
+test_audio                                                                       → ★Step 7 でビルド可能になった (18/18 PASS)
 ```
+
+Step 7 で `Makefile.linux` を用意した現在は、**全 13 本のテストが
+`make -f Makefile.linux check` 一発でビルド・実行でき、
+623 項目すべて成功します** (下記「Step 7」節を参照)。
 
 `test_core` には既存のロガー検証が 24 項目含まれており、`vm_log.c` を
 POSIX 向けに書き直した後も**全項目そのまま成功**します。`vm_log.h` の API を
@@ -715,8 +719,10 @@ POSIX 向けに書き直した後も**全項目そのまま成功**します。`
 
 `test_audio` は上流と 1 バイトも違わないファイルで、`-std=c99` 時に
 `_POSIX_C_SOURCE` が無いため `nanosleep` / `struct timespec` を解決できない
-という**既存の問題**です (上流ツリーでも同一のエラーが再現します)。
-テストとビルド系の整備は Step 7 以降の範囲なので本 PR では触っていません。
+という**既存の問題**でした (上流ツリーでも同一のエラーが再現します)。
+**Step 7 で解決済み**です。上流ファイルは書き換えず、`Makefile.linux` の
+`TEST_CFLAGS` にだけ `-D_POSIX_C_SOURCE=200809L` を足す形で通しました
+(理由は「Step 7」節の罠 (5) を参照)。
 
 ---
 
@@ -1033,7 +1039,7 @@ Step 6 の成果物は「`#ifdef` の掛け方」がほとんどで実行時に�
 | 6-c-5 | NIC bind 済みソケットから `127.0.0.1` へ**実際に届く**事 = libslirp の DNS 中継が壊れない事 |
 | 6-c-6 | `vm_nat_create(SLIRP)` が成功する事 (= `slirp_new` が `cfg.version` を受け付けた = ABI 整合) / 20ms × 10 回 `poll` を回せる事 / **`timers_active == 0`** である事 |
 | 6-c-7 | 20 回の `poll` に 1 回あたり 0.5ms 以上掛かる事 = **timeout の下限クランプが効いていて busy loop になっていない**事 |
-| 範囲 | `Makefile.linux` / `scripts/setup-gadget-linux.sh` / `windows/vim1modem.inf` が**存在しない**事 (Step 7 以降未着手の明示) |
+| 範囲 | `Makefile.linux` / `scripts/setup-gadget-linux.sh` / `windows/vim1modem.inf` が**存在する**事 + `Makefile.linux` が `-ldl` / `-lslirp` を渡す事 (Step 7/8 実装に伴い、元の「存在しない事」から意味を反転させた) |
 
 権限が足りない項目は FAIL ではなく SKIP にします (sandbox では ICMP
 ソケットが作れない等)。環境依存の値 (NIC の IP、libslirp のバージョン) は
@@ -1043,20 +1049,320 @@ Step 6 の変更が既存のテストを壊していない事も確認済みで�
 (`tests/test_nat.c` **92 項目成功**、`tests/test_linux_step5.c`
 **29 項目成功**)。
 
-### Step 6 で触っていないもの
+### Step 6 の次
 
-指示書の Step 7 以降には**一切手を付けていません**。
+Step 7 / 8 / 8-a は**実装済み**です。詳細は後述の
+[Step 7: `Makefile.linux`](#step-7-makefilelinux) と
+[Step 8: USB ガジェットと Windows 側 INF](#step-8-usb-ガジェットと-windows-側-inf)
+を参照してください。
 
 | 成果物 | Step | 状態 |
 |---|---|---|
-| `Makefile.linux` | 7 | ⬜ 未着手 |
-| `scripts/setup-gadget-linux.sh` | 8 | ⬜ 未着手 |
-| `windows/vim1modem.inf` | 8-a | ⬜ 未着手 |
+| `Makefile.linux` | 7 | ✅ 完了 |
+| `scripts/setup-gadget-linux.sh` | 8 | ✅ 完了 |
+| `scripts/99-vmodem.rules` / `scripts/vmodem.service` | 8 | ✅ 完了 |
+| `windows/vim1modem.inf` | 8-a | ✅ 完了 |
 
-`tests/test_linux_step6.c` の最後にこの 3 ファイルが存在しない事を
-検証する節を入れてあります。
+`tests/test_linux_step6.c` の最後の節は、これらが**存在する**事と
+`Makefile.linux` が Step 6 の `dlsym` のために `-ldl` を渡す事を
+検証する形に置き換えました。
 
 ---
+
+## Step 7: `Makefile.linux`
+
+指示書に載っていた雛形をそのまま置くのではなく、**実際にビルドして動かし、
+壊れていた点を直した上で**採用しました。以下は「雛形との差分」と、その根拠です。
+
+### 雛形をそのまま使うと壊れる点
+
+| # | 雛形 | 実際に起きる事 | 対処 |
+|---|---|---|---|
+| 1 | `LDFLAGS = -lm -lslirp -lpthread -lasound -ldl` | `src/serial/vm_serial.c` の `openpty(3)` が未定義参照になる | `-lutil` を追加 |
+| 2 | `CC = gcc` (または `CC ?= gcc`) | `?=` だと **効かない** | `$(origin CC)` で判定 |
+| 3 | ライブラリを `LDFLAGS` に置く | 一部の環境 (`--as-needed` + リンク順) で取りこぼす | `LDLIBS` に分離 |
+| 4 | 依存関係の記述が無い | ヘッダを直しても再ビルドされない | `-MMD -MP` + `-include $(DEPS)` |
+
+#### 罠 (2): `CC ?= gcc` が効かない理由
+
+GNU make は `CC` に**組み込みの既定値 `cc`** を持っています。`?=` は
+「未定義なら代入」なので、既定値が入っている `CC` には代入されません。
+結果、`CC ?= gcc` と書いても `cc` が使われ、クロスコンパイル時に
+`CROSS_COMPILE` が無視されます。
+
+```makefile
+CROSS_COMPILE ?=
+ifeq ($(origin CC),default)      # ← "default" = make の組み込み既定値
+CC = $(CROSS_COMPILE)gcc
+endif
+```
+
+`$(origin CC)` は、コマンドラインで `make CC=clang` と指定された場合は
+`command line`、環境変数なら `environment` を返すので、
+**ユーザ指定は上書きせず、組み込み既定値だけを置き換える**動作になります。
+
+#### 罠 (1): `-lutil` (`openpty`)
+
+`src/serial/vm_serial.c` は `--port pty` 相当の動作で `openpty(3)` を使います。
+`openpty` は歴史的に libutil にあり、glibc 2.34 以降で libc に統合されました。
+**手元の検証環境 (glibc 2.41) では `-lutil` 無しでも通ってしまう**ため、
+「動いたから大丈夫」と判断すると Armbian Noble (glibc 2.39) 側で初めて
+リンクエラーになります。雛形が `-ldl` を「古い glibc のために」入れているのと
+全く同じ理由なので、`-lutil` も明示しました
+(新しい glibc では空のスタブなので害はありません)。
+
+### `NO_ALSA` を用意しなかった理由
+
+`NO_SLIRP=1` (libslirp 無しでビルド) は用意しましたが、
+**`NO_ALSA` は意図的に用意していません**。
+
+当初 `-lasound` を外すスイッチを実装しましたが、実測すると
+`src/audio/vm_audio.c` がバックエンド振り分けで `vm_audio_alsa.c` を
+無条件に参照しており、`-lasound` を外すと必ず未定義参照になります。
+「指定すると必ず失敗するオプション」は、あるほうが有害なので削除し、
+`libasound2-dev` を必須依存としてドキュメント化しました
+(`vm_audio_null.c` はビルド時ではなく**実行時**の ALSA オープン失敗に対する
+フォールバックであり、リンク依存を消すものではありません)。
+
+### テストのビルド規則 —— `.SECONDEXPANSION:` は使えなかった
+
+テストごとにリンクするオブジェクトが違うため、当初
+`.SECONDEXPANSION:` + `$$(DEPS_$$*)` で書きましたが動きませんでした。
+パターン規則の**ステム (`$*`) 置換は二次展開より前に起きる**ため、
+`$$(DEPS_$$*)` が意図した変数名に解決されず、
+`*** multiple target patterns` で停止します。
+
+`$(foreach)` + `$(eval)` で**明示規則を生成**する方式に変更しました。
+
+```makefile
+define VM_TEST_RULE
+$(BUILD)/$(1): tests/$(1).c $(patsubst %.c,$(BUILD)/t/%.o,$(DEPS_$(1)))
+	$(Q)$$(CC) $$(TEST_CFLAGS) $$< ... -o $$@
+endef
+$(foreach t,$(TESTS),$(eval $(call VM_TEST_RULE,$(t))))
+```
+
+### 罠 (5): テストだけ `-D_POSIX_C_SOURCE` が必要だった
+
+`-std=c99` は `__STRICT_ANSI__` を定義するので、glibc の `<time.h>` は
+`nanosleep()` と `struct timespec` を隠します。実際にビルドすると:
+
+```
+tests/test_audio.c:40:21: error: storage size of 'ts' isn't known
+tests/test_audio.c:43:5:  error: implicit declaration of function 'nanosleep'
+make: *** [Makefile.linux:348: build/test_audio] Error 1
+```
+
+全ソースを調べたところ、
+
+* `src/*.c` … `vm_log.c` は `_POSIX_C_SOURCE`、`vm_nat_slirp.c` は
+  `_GNU_SOURCE` を**それぞれ自前で定義**している
+* `tests/test_linux_*.c` … 同じく自前で定義している (すべて `#ifndef` ガード付き)
+* **`tests/test_audio.c` だけ何も定義していない** (上流由来)
+
+という状態でした。対処として:
+
+* `CFLAGS` 本体には足さない —— `src/*.c` は自衛済みで、
+  グローバルに定義すると「どのファイルが何を必要としているか」が消える
+* `-std=gnu99` に緩めない —— 指示書の `-std=c99` を守る
+* 上流の `tests/test_audio.c` は書き換えない
+
+の 3 点を満たすため、**`TEST_CFLAGS` にだけ** `-D_POSIX_C_SOURCE=200809L`
+を追加しました。各テストの `#ifndef` ガードのおかげで二重定義にもなりません。
+
+### 使えるターゲット
+
+```bash
+make -f Makefile.linux              # vmodem をビルド
+make -f Makefile.linux tests        # テストバイナリをビルド
+make -f Makefile.linux check        # 全テストをビルドして実行
+make -f Makefile.linux check-deps   # ヘッダ/ライブラリが揃っているか事前確認
+make -f Makefile.linux print-config # 実際に使われる CC/CFLAGS/LDLIBS を表示
+make -f Makefile.linux install      # PREFIX (既定 /usr/local) へ配置
+make -f Makefile.linux gadget-install  # udev ルールと systemd unit を配置
+make -f Makefile.linux clean / distclean
+make -f Makefile.linux help
+```
+
+主な変数: `CROSS_COMPILE=` / `NO_SLIRP=1` / `PREFIX=` / `DESTDIR=` / `V=1`。
+
+`install` は `vmodem` に加えて `scripts/setup-gadget-linux.sh` を
+`$(PREFIX)/bin/vmodem-setup-gadget` として入れ、`/etc/vmodem/config.ini` は
+**既存があれば上書きしません**。
+
+---
+
+## Step 8: USB ガジェットと Windows 側 INF
+
+### 成果物
+
+| ファイル | 役割 |
+|---|---|
+| `scripts/setup-gadget-linux.sh` | configfs で CDC-ACM ガジェットを構成 (冪等) |
+| `scripts/99-vmodem.rules` | `/dev/ttyGS0` 出現を契機に systemd unit を起動 |
+| `scripts/vmodem.service` | 実際に `vmodem` を動かす unit |
+| `windows/vim1modem.inf` | Windows XP 側で COM ポートとして認識させる INF (Step 8-a) |
+
+### `bDeviceClass = 0xEF` —— Windows で COM ポートとして見えるかの分かれ目
+
+CDC-ACM は「制御インタフェース + データインタフェース」の 2 本組で、
+これを 1 つの機能として束ねるのが **IAD (Interface Association Descriptor)** です。
+Windows は IAD を見て初めて子デバイス
+`USB\VID_1209&PID_0001&MI_00` を生成し、そこに `usbser.sys` が当たります。
+IAD を有効にするには、デバイス記述子を次にしておく必要があります。
+
+```sh
+write_attr "$GADGET_DIR/bDeviceClass"    "0xef"   # Miscellaneous
+write_attr "$GADGET_DIR/bDeviceSubClass" "0x02"   # Common Class
+write_attr "$GADGET_DIR/bDeviceProtocol" "0x01"   # Interface Association
+```
+
+ここを既定 (`0x00`) のままにすると、Windows からは
+「複合デバイスのうち何かよく分からないもの」に見え、INF を当てても
+COM ポートになりません。**IAD を解釈できるのは XP SP2 以降**で、
+SP1 や Windows 2000 では別の手当てが要ります (README 末尾の制約参照)。
+
+### 冪等性 —— 「既に設定済みなら触らない」
+
+指示書の要求どおり、2 回目以降の実行で構成を壊さない設計にしました。
+これは単なる親切ではなく**必須**です。UDC にバインド済みのガジェットに
+属性を書くと `EBUSY` で失敗するためです。
+
+```sh
+write_attr() {                      # 値が同じなら書かない
+    [ "$(cat "$1" 2>/dev/null)" = "$2" ] && return 0
+    printf '%s' "$2" > "$1"
+}
+```
+
+`setup` / `status` / `teardown` / `--force` の 4 モードを持ち、
+`teardown` は configfs の制約に従って**逆順で `rmdir` のみ**を使います
+(`rm -rf` は効きません)。
+
+### 実機なしで冪等性を検証した方法
+
+検証環境には configfs も UDC もありません
+(`/sys/kernel/config` 無し、`/proc/filesystems` に `configfs` 無し、
+`/sys/class/udc` 無し、`modprobe` 無し)。
+「冪等です」と書くだけでは検証になっていないので、
+環境変数 `VM_TEST_ROOT` で configfs の位置を差し替えられるようにし、
+**スクリプトのロジック自体をテストから実行**しています。
+
+```
+VM_TEST_ROOT=/tmp/gr ./scripts/setup-gadget-linux.sh setup
+```
+
+`tests/test_linux_step78.c` はこれを使って
+「1 回目の setup → ツリーを記録 → 2 回目の setup → ツリーが完全に一致」
+「teardown で全消去 → 二重 teardown が無害 → 再 setup が成功」
+「UDC が無ければ失敗する」「別名 UDC へフォールバックする」
+を実際に走らせて確認します。
+
+この方式で**実バグを 1 件検出しました**。実 configfs は
+カーネル生成の属性ファイルが残っていても `rmdir` が成功しますが、
+ただのディレクトリでは `ENOTEMPTY` になります。
+シミュレーション側で通常ファイルだけを消す `vm_rmdir()` を用意して
+挙動を合わせました (サブディレクトリとシンボリックリンクは消さないので、
+**削除順序の検証は意味を保ったまま**です)。
+
+なお、これで検証できるのは**スクリプトの論理**だけで、
+USB のエニュメレーション自体は実機でしか確認できません。
+
+### VID/PID は `0x1209` / `0x0001` —— ただし出荷不可
+
+指示書どおり pid.codes の `1209:0001` を既定にしましたが、これは
+**Test PID** です。pid.codes のポリシー上、社内試験専用で
+**配布物に載せてはいけません**。スクリプトは既定値のまま実行すると
+その旨を警告し、`VM_VID` / `VM_PID` で上書きできます
+(上書きすると警告も消えます)。同じ値が `windows/vim1modem.inf` の
+ハードウェア ID とも一致している事をテストで突き合わせています。
+
+### 指示書の udev ルールをそのまま採用しなかった理由
+
+指示書の例は次のとおりでした。
+
+```
+ACTION=="add", KERNEL=="ttyGS0", RUN+="/usr/local/bin/vmodem-start.sh"
+```
+
+しかし `systemd-udev(7)` の `RUN` の仕様は
+**「このコマンドから fork された全てのプロセスは、イベント処理の完了後に
+無条件に kill される」**です。`vmodem` は常駐デーモンなので、
+この書き方だと起動直後に殺されます。正しい書き方は、udev から
+service unit を **pull-in** する形です。
+
+```
+ACTION=="add", SUBSYSTEM=="tty", KERNEL=="ttyGS0", \
+    TAG+="systemd", ENV{SYSTEMD_WANTS}+="vmodem.service"
+```
+
+対になる `scripts/vmodem.service` は `BindsTo=dev-ttyGS0.device` を持ち、
+ガジェットが外れると自動停止します。`ExecStartPre` に
+`-/usr/local/bin/vmodem-setup-gadget` を置いてあるので
+(先頭の `-` は失敗許容)、ガジェット未設定でも自力で復帰します。
+
+### Step 8-a: `windows/vim1modem.inf`
+
+```ini
+[Version]
+Signature   = "$Windows NT$"
+Class=Ports
+ClassGuid   = {4D36E978-E325-11CE-BFC1-08002BE10318}
+DriverVer   = 04/01/2009,5.1.2600.0
+; CatalogFile is deliberately omitted: no .cat is shipped (unsigned).
+
+[DeviceList.NT]
+%DESCRIPTION% = DriverInstall.NT, USB\VID_1209&PID_0001&MI_00
+%DESCRIPTION% = DriverInstall.NT, USB\VID_1209&PID_0001
+%DESCRIPTION% = DriverInstall.NT, USB\VID_1209&PID_0001&MI_02
+
+[DriverInstall.NT]
+include     = mdmcpq.inf          ; usbser.sys の共通処理を再利用
+CopyFiles   = DriverCopyFiles.NT
+```
+
+ポイント:
+
+* **`&MI_00` 付きのハードウェア ID が本命**。IAD によって生成される
+  子デバイスに一致させる必要があります。`&MI_02` と素の ID も
+  保険として並べてあります。
+* **`include = mdmcpq.inf`** で `usbser.sys` 用の定型処理を借ります
+  (自前で `AddService` を全部書くより、XP の実装差に強い)。
+* **`CatalogFile` は書きません**。`.cat` を同梱しないので、
+  存在しないカタログを指すと署名検証で失敗します。未署名 INF は
+  XP では「続行」で入りますが、**64bit Vista 以降はカーネルモード
+  ドライバ署名の強制があり、この INF のままでは入りません**。
+
+#### INF は ASCII + CRLF でなければならない
+
+最初に書いた版は日本語コメント入り (非 ASCII 4215 バイト) でしたが、
+**自分で書いたテストが落として気付きました**。XP の setupapi は INF を
+システムのコードページで **ANSI として読む**ため、UTF-8 のマルチバイトは
+化けるだけでなくパース自体を壊し得ます。全文を ASCII に書き直し、
+改行も CRLF に統一しました (`tests/test_linux_step78.c` が
+「非 ASCII バイト 0」「LF 単独 0 / CRLF 211」を assert します)。
+日本語の設計メモはこの README 側に置いています。
+
+同じテストで `Class       = Ports` (余分な空白) も検出したので
+`Class=Ports` に直しています。
+
+### `/dev/ttyGS0` では DTR / DCD が読めない
+
+指示書が調査対象に挙げていた点です。Linux 6.12 のソースを確認しました。
+
+* `drivers/usb/gadget/function/u_serial.c` の `gs_tty_ops` には
+  **`.tiocmget` / `.tiocmset` が無い** → `/dev/ttyGS0` への `TIOCMGET` は
+  `ENOTTY` を返します
+* `f_acm.c` はホストから来た DTR を `port_handshake_bits` に保持していますが、
+  **ユーザ空間には公開していません**
+
+つまり「ホストが DTR を落としたら切断する」といった実装は
+`/dev/ttyGS0` 越しには不可能です。`vmodem` 側は DTR/DCD を
+AT コマンド (`ATH` / `+++`) とタイムアウトで代替する設計なので実害はありませんが、
+制約として明記しておきます。テストではこの点を `SKIP` として記録しています。
+
+---
+
 
 ## ビルドに必要なもの
 
@@ -1065,6 +1371,7 @@ Step 6 の変更が既存のテストを壊していない事も確認済みで�
 | ボード | Khadas VIM1 (Amlogic S905X) |
 | OS | Armbian (Ubuntu Noble ベース) / Linux 6.12 |
 | コンパイラ | gcc 13 以降 (Armbian Noble の既定は gcc 13.2 / 13.3) |
+| PTY | `libutil` (`openpty`; glibc 2.34 以降は libc に統合) |
 | 音声 | `libasound2-dev` (alsa-lib) |
 | NAT | `libslirp-dev` (`--net slirp` 用。Step 6 で有効化済み) |
 
@@ -1072,8 +1379,14 @@ Step 6 の変更が既存のテストを壊していない事も確認済みで�
 sudo apt install build-essential libasound2-dev libslirp-dev
 ```
 
-`Makefile.linux` は Step 7 の成果物なのでまだありません。現時点では
-上記の `gcc` コマンドで個別にコンパイル・テストしてください。
+ビルドは `Makefile.linux` (Step 7 の成果物) で行います。
+
+```bash
+make -f Makefile.linux            # vmodem をビルド
+make -f Makefile.linux check      # 全テストをビルドして実行
+make -f Makefile.linux check-deps # 依存が揃っているか確認
+make -f Makefile.linux help       # 使えるターゲット一覧
+```
 
 `libslirp-dev` を入れて `-DVMODEM_HAVE_LIBSLIRP` を付ければ
 `--net slirp` が使えます。Step 6 で ABI 差を実行時に吸収したので、
@@ -1093,6 +1406,7 @@ sudo apt install build-essential libasound2-dev libslirp-dev
 ## ディレクトリ構成
 
 ```
+Makefile.linux           ★Linux 版ビルド (Step 7)
 include/vmodem/          公開ヘッダ
 src/core/
   vm_config.c            config.ini のパーサ
@@ -1117,11 +1431,20 @@ src/serial/
   vm_serial_win32.c      Windows (上流)
   vm_serial_linux.c      ★Linux 実 tty / CDC-ACM (Step 1)
 src/main.c               ★エントリポイント (Step 3 でシグナル処理を POSIX 化)
+scripts/
+  setup-gadget-linux.sh  ★configfs で CDC-ACM ガジェットを構成 (Step 8・冪等)
+  99-vmodem.rules        ★udev ルール (Step 8。RUN+= ではなく SYSTEMD_WANTS)
+  vmodem.service         ★systemd unit (Step 8。BindsTo=dev-ttyGS0.device)
+windows/
+  vim1modem.inf          ★Windows XP 用 INF (Step 8-a。ASCII + CRLF 必須)
 tests/
   test_linux_port.c      ★Step 1・2 の検証
   test_linux_step34.c    ★Step 3・4 の検証
   test_linux_step5.c     ★Step 5・5-a の検証
   test_linux_step6.c     ★Step 6-a・6-b・6-c の検証
+  test_linux_step78.c    ★Step 7・8・8-a の検証
+                           (ガジェットスクリプトを VM_TEST_ROOT で実行して
+                            冪等性・teardown 順序まで実測する)
 docs/README-windows.md   上流 Windows 版の README (libslirp の罠など)
 ```
 

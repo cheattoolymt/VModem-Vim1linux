@@ -1,0 +1,524 @@
+# ===========================================================================
+#  Makefile.linux - VModem Linux (Khadas VIM1 / Armbian) ビルド
+#
+#  SPDX-License-Identifier: BSD-2-Clause
+#
+#  使い方:
+#     make -f Makefile.linux              # vmodem をビルド
+#     make -f Makefile.linux -j4          # 並列ビルド (VIM1 は 4 コア)
+#     make -f Makefile.linux tests        # テストもビルド
+#     make -f Makefile.linux check        # テストをビルドして実行
+#     make -f Makefile.linux clean        # 生成物を削除
+#     make -f Makefile.linux help         # 全ターゲットの一覧
+#
+#     make -f Makefile.linux NO_SLIRP=1   # libslirp 無し (--net loopback/none)
+#     make -f Makefile.linux V=1          # コマンドラインを表示
+#
+# ===========================================================================
+#  指示書の雛形から変更した点と、その理由
+# ===========================================================================
+#  指示書 Step 7 は以下の雛形を提示している。
+#
+#      CFLAGS  = -O2 -std=c99 -Wall -Iinclude -DVMODEM_LINUX -DVMODEM_HAVE_LIBSLIRP
+#      LDFLAGS = -lm -lslirp -lpthread -lasound -ldl
+#      $(TARGET): $(SRCS)
+#              $(CC) $(CFLAGS) $(SRCS) $(LDFLAGS) -o $(TARGET)
+#
+#  これは「1 コマンドで通る」事は実測で確認した (24 TU + main.c が
+#  警告ゼロでリンクできる)。しかし実運用には次の 6 つの問題がある。
+#  雛形の意図 (フラグ・ソース一覧) は完全に保ちつつ、そこだけを直した。
+#
+#  ------------------------------------------------------------------
+#  (1) ★実害★ -lutil が抜けている
+#  ------------------------------------------------------------------
+#      src/serial/vm_serial.c は PTY バックエンド (VM_SERIAL_BACKEND_PTY)
+#      で openpty(3) を呼ぶ。openpty は本来 libutil の関数である。
+#
+#        $ nm -D /lib/*/libc.so.6 | grep ' T openpty'
+#        ... openpty                 <- glibc 2.34 以降は libc に統合済み
+#
+#      開発 sandbox (glibc 2.41) と VIM1 の Armbian Noble (glibc 2.39) は
+#      どちらも 2.34 以降なので **雛形のままでもリンクは通る**。
+#      だが 2.34 未満の環境や musl では
+#
+#        undefined reference to `openpty'
+#
+#      で落ちる。-ldl を「glibc 2.34 以降では no-op だが安全のため付ける」
+#      という理由で入れているのと全く同じ理由で、-lutil も入れるべきである。
+#      (Step 6 のテストが -ldl についてまさにその判定をしている)
+#
+#  ------------------------------------------------------------------
+#  (2) ★実害★ 毎回 25 ファイルを全部コンパイルし直す
+#  ------------------------------------------------------------------
+#      雛形は $(TARGET): $(SRCS) なので、1 ファイル直すと全再ビルド。
+#      VIM1 (Cortex-A53 1.5GHz) でのフルビルドは実測で 40 秒級になる。
+#      ヘッダ 1 個の修正で毎回 40 秒待つのは移植作業に耐えない。
+#
+#      → .o を build/ に分けて中間生成し、-MMD -MP でヘッダ依存も
+#        自動追跡する。1 ファイル修正なら 2 秒で済む。
+#        並列ビルド (-j4) も効くようになる。
+#
+#  ------------------------------------------------------------------
+#  (3) ヘッダ依存が無いので「直したのに反映されない」事故が起きる
+#  ------------------------------------------------------------------
+#      雛形は .c の変更しか見ない。include/vmodem/*.h を直しても
+#      再ビルドされないため、古い .o が混ざったバイナリが出来る。
+#      構造体のメンバを増やした時にこれが起きると、原因不明の
+#      メモリ破壊になる (libslirp の SlirpConfig で実際に踏み得る)。
+#
+#      → -MMD -MP で生成した .d を include する。
+#
+#  ------------------------------------------------------------------
+#  (4) 依存ライブラリが無い時のエラーが不親切
+#  ------------------------------------------------------------------
+#      libslirp-dev が無いと
+#        fatal error: libslirp.h: No such file or directory
+#      とだけ出る。apt で何を入れれば良いか分からない。
+#
+#      → check-deps ターゲットで事前に検査し、
+#        「sudo apt install ...」を提示する。
+#
+#  ------------------------------------------------------------------
+#  (5) libslirp を外した構成が作れない
+#  ------------------------------------------------------------------
+#      libslirp 無しで PPP だけ検証したい場面がある (Step 5 までの
+#      段階がまさにそれ)。雛形はフラグが固定なので、その都度
+#      Makefile を書き換える事になる。
+#
+#      → NO_SLIRP=1 で切り替えられるようにした。
+#        vm_nat_slirp.c は VMODEM_HAVE_LIBSLIRP が無いと
+#        vm_nat_ops_slirp() が NULL を返す実装になっているので、
+#        ソースからは外さず -DVMODEM_HAVE_LIBSLIRP と -lslirp だけを
+#        落とす。--net slirp を指定すると実行時に
+#        「libslirp が組み込まれていません」と案内される。
+#
+#      ★ NO_ALSA は用意しない ★
+#        当初 -lasound を外す NO_ALSA=1 を実装したが、実測すると
+#
+#          undefined reference to `snd_pcm_open'  (他 30 件)
+#
+#        でリンクが落ちる。理由は指示書 Step 2 が
+#        「vm_audio_alsa.c をビルド時に除外しないこと」を明確に
+#        要求しているためで、除外しない以上 alsa-lib のシンボルは
+#        必ず解決が必要になる。つまり
+#
+#          「ALSA を外したビルド」と
+#          「vm_audio_alsa.c を常にコンパイルする」は両立しない
+#
+#        NO_ALSA を残すと「指定すると必ずリンクエラーになる
+#        スイッチ」になるだけなので削除した。libasound2-dev は
+#        必須依存である。音を出したくない場合はビルドではなく
+#        実行時に落とす:
+#          ./vmodem --quiet          または
+#          config.ini の audio_enable = false
+#        VIM1 で HDMI 音声が鳴らない場合も、実行時に
+#        snd_pcm_open() が失敗して null にフォールバックするので
+#        ビルドを変える必要は無い (これが Step 2 の設計意図)。
+#
+#  ------------------------------------------------------------------
+#  (6) -DVMODEM_LINUX は現状どのコードも参照していない
+#  ------------------------------------------------------------------
+#      指示書が指定しているので **そのまま付ける** が、
+#      実測 (grep) では src/ include/ のどこも参照していない。
+#      移植は __linux__ / _WIN32 / _POSIX_C_SOURCE で分岐している。
+#      将来 Linux 固有分岐を足す時の予約として維持する。
+#      「付いているのに効かない」事を知らないと、これを頼りに
+#      #ifdef を書いて動かず悩む事になるので明記しておく。
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# ツールチェイン
+#   CROSS_COMPILE を付ければ x86 のホストから VIM1 (aarch64) 向けに
+#   クロスビルドできる。VIM1 上で直接叩くなら何も指定しなくて良い。
+#     make -f Makefile.linux CROSS_COMPILE=aarch64-linux-gnu-
+# ---------------------------------------------------------------------------
+CROSS_COMPILE ?=
+
+# ★ CC ?= gcc では効かない ★
+#   make は CC=cc を **builtin default** として持っている。?= は
+#   「未定義なら」ではなく「未設定なら」なので、builtin default が
+#   入っている CC には代入されず、指示書が要求する gcc ではなく
+#   cc が使われてしまう (実測: print-config で CC = cc になる)。
+#   Debian/Ubuntu では cc -> gcc の symlink なので気付きにくいが、
+#   clang が cc を握っている環境では別のコンパイラでビルドされる。
+#   $(origin CC) が default の時だけ上書きするのが正しい。
+#   コマンドラインや環境変数で CC を渡した場合はそちらを尊重する。
+ifeq ($(origin CC),default)
+CC = $(CROSS_COMPILE)gcc
+endif
+PKG_CONFIG ?= $(CROSS_COMPILE)pkg-config
+
+# ---------------------------------------------------------------------------
+# 機能スイッチ
+#   NO_ALSA は意図的に存在しない (上記 (5) 参照)。
+# ---------------------------------------------------------------------------
+NO_SLIRP ?= 0
+
+# ---------------------------------------------------------------------------
+# フラグ
+#   指示書の CFLAGS をそのまま含み、以下を追加している。
+#     -MMD -MP       : ヘッダ依存の自動生成 (上記 (3))
+#     -Wextra        : 移植コードは警告ゼロを維持できているので有効化
+#     -D_POSIX_C_SOURCE は付けない。各 .c が自前で必要な分だけ
+#     先頭で定義している (vm_nat_slirp.c は _GNU_SOURCE、
+#     vm_log.c は _POSIX_C_SOURCE)。ここで一律に定義すると
+#     .c 側の #if !defined(...) と衝突し、意図しない機能セットになる。
+# ---------------------------------------------------------------------------
+CFLAGS  ?= -O2
+CFLAGS  += -std=c99 -Wall -Wextra -Iinclude -MMD -MP -DVMODEM_LINUX
+LDFLAGS ?=
+LDLIBS   = -lm -lpthread
+
+# libslirp: 指示書どおり -DVMODEM_HAVE_LIBSLIRP + -lslirp。
+# dlsym を使うので -ldl も付ける (glibc 2.34+ では no-op)。
+ifeq ($(NO_SLIRP),0)
+CFLAGS += -DVMODEM_HAVE_LIBSLIRP
+LDLIBS += -lslirp -ldl
+endif
+
+# ALSA: 必須依存。外せない理由は上記 (5) を参照。
+LDLIBS += -lasound
+
+# openpty(3) 用。上記 (1) の理由で必須。
+LDLIBS += -lutil
+
+# ---------------------------------------------------------------------------
+# ソース一覧
+#   指示書 Step 7 の SRCS と完全に同一の 25 ファイル。
+#
+#   ★ここに無い 3 ファイルは意図的な除外★
+#     src/net/vm_hostroute.c  Windows 版 (Step 5-a の Linux 版に置換)
+#                             ただし翻訳単位ごと _WIN32 で囲んであるので
+#                             誤って足してもリンクは壊れない (Step 5-3)
+#     src/net/vm_winsock.c    Linux では main.c が呼ばない (#ifdef _WIN32)
+#     src/audio/vm_audio_wasapi.c / src/serial/vm_serial_win32.c
+#                             Windows 専用バックエンド
+#
+#   ★ vm_audio_alsa.c は常に入れる ★
+#     指示書 Step 2「ビルド時に除外しないこと」。実行時に
+#     snd_pcm_open() が失敗したら null にフォールバックする設計。
+#     このため -lasound は外せない (NO_ALSA を用意しない理由)。
+# ---------------------------------------------------------------------------
+SRCS = src/main.c \
+       src/core/vm_config.c \
+       src/core/vm_log.c \
+       src/core/vm_ringbuf.c \
+       src/core/vm_types.c \
+       src/dsp/vm_handshake.c \
+       src/dsp/vm_resample.c \
+       src/dsp/vm_tone.c \
+       src/dsp/vm_v34.c \
+       src/dsp/vm_v8.c \
+       src/audio/vm_audio.c \
+       src/audio/vm_audio_null.c \
+       src/audio/vm_audio_alsa.c \
+       src/modem/vm_at.c \
+       src/modem/vm_modem.c \
+       src/modem/vm_sequence.c \
+       src/net/vm_eth.c \
+       src/net/vm_hdlc.c \
+       src/net/vm_nat.c \
+       src/net/vm_nat_loopback.c \
+       src/net/vm_nat_slirp.c \
+       src/net/vm_hostroute_linux.c \
+       src/net/vm_ppp.c \
+       src/serial/vm_serial.c \
+       src/serial/vm_serial_linux.c
+
+TARGET  = vmodem
+BUILD   = build
+OBJS    = $(SRCS:%.c=$(BUILD)/%.o)
+DEPS    = $(OBJS:.o=.d)
+
+# ---------------------------------------------------------------------------
+# テスト
+#   各テストは「本体の一部の .c だけ」をリンクする作りになっている
+#   (テスト冒頭のコメントに gcc 行が書いてある)。ここではそれを
+#   忠実に再現する。本体の .o を流用すると main() が重複するため、
+#   テスト用は専用の .o ツリー (build/t) に分けてビルドする。
+#
+#   ★ test_linux_step5 は vm_hostroute.c と vm_hostroute_linux.c を
+#     意図的に両方リンクする ★ (Step 5-3 の重複定義検証そのもの)
+# ---------------------------------------------------------------------------
+#
+#   ★ 罠3: テストだけ -D_POSIX_C_SOURCE が必要 ★
+#     -std=c99 は __STRICT_ANSI__ を定義するので、glibc の <time.h> は
+#     nanosleep() / struct timespec を隠す。テスト側は
+#       tests/test_linux_port.c   … #ifndef _POSIX_C_SOURCE で自前定義済み
+#       tests/test_linux_step34.c … 同上
+#       tests/test_linux_step5.c  … 同上
+#       tests/test_linux_step6.c  … _GNU_SOURCE を自前定義
+#     と自衛しているが、**tests/test_audio.c だけ何も定義していない**。
+#     実測 (make -f Makefile.linux tests):
+#       tests/test_audio.c:40: error: storage size of 'ts' isn't known
+#       tests/test_audio.c:43: error: implicit declaration of 'nanosleep'
+#     test_audio.c は Windows 時代からある既存テストで、
+#     「上流テストは一切変更せず同じ結果を出す」方針なので
+#     ファイルではなくビルド側で解決する。
+#
+#     ・$(CFLAGS) 本体には足さない
+#       → src/*.c は各々 _POSIX_C_SOURCE / _GNU_SOURCE / _DEFAULT_SOURCE を
+#         インクルード前に自前定義している (vm_log.c, vm_serial.c,
+#         vm_nat_slirp.c)。外から一律に与えると意図が二重になる。
+#     ・-std=gnu99 に緩めない
+#       → 指示書の -std=c99 を守り、かつ移植性チェックを弱めたくない。
+#     ・テスト用 CFLAGS にだけ -D_POSIX_C_SOURCE=200809L を足す
+#       → 自前定義側は全て #ifndef / #if !defined ガード付きなので
+#         再定義警告は出ない。_GNU_SOURCE との併用も glibc では正当。
+TEST_CFLAGS = $(CFLAGS) -Isrc/net -Isrc/audio -Isrc/serial \
+              -D_POSIX_C_SOURCE=200809L
+
+CORE_SRCS  = src/core/vm_config.c src/core/vm_log.c \
+             src/core/vm_ringbuf.c src/core/vm_types.c
+DSP_SRCS   = src/dsp/vm_handshake.c src/dsp/vm_resample.c src/dsp/vm_tone.c \
+             src/dsp/vm_v34.c src/dsp/vm_v8.c
+AUDIO_SRCS = src/audio/vm_audio.c src/audio/vm_audio_null.c \
+             src/audio/vm_audio_alsa.c
+MODEM_SRCS = src/modem/vm_at.c src/modem/vm_modem.c src/modem/vm_sequence.c
+NET_SRCS   = src/net/vm_eth.c src/net/vm_hdlc.c src/net/vm_nat.c \
+             src/net/vm_nat_loopback.c src/net/vm_nat_slirp.c \
+             src/net/vm_hostroute_linux.c src/net/vm_ppp.c
+SER_SRCS   = src/serial/vm_serial.c src/serial/vm_serial_linux.c
+
+# テスト名 -> リンクするソース
+DEPS_test_core        = $(CORE_SRCS)
+DEPS_test_dsp         = $(CORE_SRCS) $(DSP_SRCS)
+DEPS_test_resample    = $(CORE_SRCS) $(DSP_SRCS)
+DEPS_test_at          = $(CORE_SRCS) $(MODEM_SRCS) $(DSP_SRCS) $(AUDIO_SRCS) \
+                        $(NET_SRCS) $(SER_SRCS)
+DEPS_test_sequence    = $(CORE_SRCS) $(MODEM_SRCS) $(DSP_SRCS) $(AUDIO_SRCS) \
+                        $(NET_SRCS) $(SER_SRCS)
+DEPS_test_audio       = $(CORE_SRCS) $(DSP_SRCS) $(AUDIO_SRCS)
+DEPS_test_ppp         = $(CORE_SRCS) $(NET_SRCS)
+DEPS_test_nat         = $(CORE_SRCS) $(NET_SRCS)
+DEPS_test_linux_port  = $(CORE_SRCS) $(DSP_SRCS) $(AUDIO_SRCS) $(SER_SRCS)
+DEPS_test_linux_step34 = $(CORE_SRCS)
+DEPS_test_linux_step5 = $(CORE_SRCS) $(NET_SRCS) src/net/vm_hostroute.c
+DEPS_test_linux_step6 = $(CORE_SRCS) $(NET_SRCS)
+DEPS_test_linux_step78 = $(CORE_SRCS)
+
+TESTS = test_core test_dsp test_resample test_at test_sequence test_audio \
+        test_ppp test_nat test_linux_port test_linux_step34 \
+        test_linux_step5 test_linux_step6 test_linux_step78
+
+TEST_BINS = $(addprefix $(BUILD)/,$(TESTS))
+
+# ---------------------------------------------------------------------------
+# 表示制御 (V=1 で生コマンド)
+# ---------------------------------------------------------------------------
+ifeq ($(V),1)
+Q =
+else
+Q = @
+endif
+
+.PHONY: all tests check clean distclean help check-deps install uninstall \
+        gadget-install print-config
+
+all: $(TARGET)
+
+# ---------------------------------------------------------------------------
+# 本体
+# ---------------------------------------------------------------------------
+$(TARGET): $(OBJS)
+	$(Q)echo "  LD      $@"
+	$(Q)$(CC) $(OBJS) $(LDFLAGS) $(LDLIBS) -o $@
+
+$(BUILD)/%.o: %.c
+	$(Q)mkdir -p $(dir $@)
+	$(Q)echo "  CC      $<"
+	$(Q)$(CC) $(CFLAGS) -c $< -o $@
+
+# ---------------------------------------------------------------------------
+# テスト
+#   $(DEPS_<name>) を .o に変換してリンクする。
+#   テスト側の .o は build/t/ に置き、本体の .o と混ぜない
+#   (本体の .o には main() を持つ main.o が居るため)。
+#
+# ★ここでパターン規則 + .SECONDEXPANSION を使ってはいけない★
+#   最初にこう書いて動かなかったので、理由を記録しておく。
+#
+#     .SECONDEXPANSION:
+#     $(BUILD)/test_%: tests/test_%.c \
+#                      $$(patsubst %.c,$(BUILD)/t/%.o,$$(DEPS_test_$$*))
+#
+#   これは 2 つの理由で機能しない。
+#
+#   (1) パターン規則の前提条件では、二次展開より **先に** `%` が
+#       ステム (core, nat, ...) へ置換される。つまり二次展開の時点で
+#       patsubst の引数は `%.c` ではなく `core.c` になっており、
+#       src/core/vm_log.c 等には一致しない。結果、前提条件が空になる。
+#       症状は「レシピは正しく展開されるのに .o が作られず
+#       `cannot find build/t/src/core/vm_types.o` でリンクが落ちる」
+#       という分かりにくいもので、実際に踏んだ。
+#
+#   (2) `%` を避けて $(addprefix ...) や $(VAR:.c=.o) に書き換えると、
+#       今度はターゲット側の `%` と合わせて
+#         *** multiple target patterns.  Stop.
+#       になる。`:` を含む式がターゲット部に見えてしまうため。
+#
+#   → $(foreach) + $(eval) で **テストごとに明示的な規則を生成**する。
+#     一次展開だけで完結するので上記の罠を両方回避できる。
+#     生成後の姿は手書きで 13 個並べたのと完全に等価。
+# ---------------------------------------------------------------------------
+define VM_TEST_RULE
+$(BUILD)/$(1): tests/$(1).c $(patsubst %.c,$(BUILD)/t/%.o,$(DEPS_$(1)))
+	$(Q)mkdir -p $$(dir $$@)
+	$(Q)echo "  LD      $$@"
+	$(Q)$$(CC) $$(TEST_CFLAGS) $$< \
+	    $(patsubst %.c,$(BUILD)/t/%.o,$(DEPS_$(1))) \
+	    $$(LDFLAGS) $$(LDLIBS) -o $$@
+endef
+$(foreach t,$(TESTS),$(eval $(call VM_TEST_RULE,$(t))))
+
+$(BUILD)/t/%.o: %.c
+	$(Q)mkdir -p $(dir $@)
+	$(Q)echo "  CC[t]   $<"
+	$(Q)$(CC) $(TEST_CFLAGS) -c $< -o $@
+
+tests: $(TEST_BINS)
+
+# check: 全テストを実行。
+#   test_linux_step34 は vmodem 本体を起動してシグナルを送るので
+#   バイナリのパスを渡す (無ければ当該節を SKIP する作り)。
+#   test_linux_step78 / step6 は成果物のパスをリポジトリ ルートからの
+#   相対で見るので、必ずルートで実行する。
+check: $(TARGET) tests
+	$(Q)fail=0; \
+	for t in $(TEST_BINS); do \
+	    echo ""; \
+	    echo "=== $$t ==="; \
+	    if [ "$$(basename $$t)" = "test_linux_step34" ]; then \
+	        $$t ./$(TARGET) || fail=1; \
+	    else \
+	        $$t || fail=1; \
+	    fi; \
+	done; \
+	echo ""; \
+	if [ $$fail -eq 0 ]; then echo "全テスト成功"; \
+	else echo "失敗したテストがあります"; exit 1; fi
+
+# ---------------------------------------------------------------------------
+# 依存チェック
+#   pkg-config が無い環境でも動くよう、ヘッダの存在も直接見る。
+# ---------------------------------------------------------------------------
+check-deps:
+	$(Q)miss=""; \
+	if [ "$(NO_SLIRP)" = "0" ]; then \
+	    if ! $(PKG_CONFIG) --exists slirp 2>/dev/null && \
+	       [ ! -f /usr/include/libslirp.h ]; then \
+	        miss="$$miss libslirp-dev"; \
+	    fi; \
+	fi; \
+	if ! $(PKG_CONFIG) --exists alsa 2>/dev/null && \
+	   [ ! -f /usr/include/alsa/asoundlib.h ]; then \
+	    miss="$$miss libasound2-dev"; \
+	fi; \
+	if ! command -v $(CC) >/dev/null 2>&1; then \
+	    miss="$$miss build-essential"; \
+	fi; \
+	if [ -n "$$miss" ]; then \
+	    echo "不足している依存:$$miss"; \
+	    echo ""; \
+	    echo "  sudo apt install$$miss"; \
+	    echo ""; \
+	    echo "libslirp を使わない構成なら NO_SLIRP=1 を付けて下さい。"; \
+	    echo "libasound2-dev は必須です (Step 2 が vm_audio_alsa.c の"; \
+	    echo "ビルド時除外を禁じているため外せません)。"; \
+	    exit 1; \
+	fi; \
+	echo "依存は揃っています"; \
+	if $(PKG_CONFIG) --exists slirp 2>/dev/null; then \
+	    echo "  libslirp $$($(PKG_CONFIG) --modversion slirp)"; \
+	fi; \
+	if $(PKG_CONFIG) --exists alsa 2>/dev/null; then \
+	    echo "  alsa-lib $$($(PKG_CONFIG) --modversion alsa)"; \
+	fi; \
+	echo "  $(CC) $$($(CC) -dumpversion 2>/dev/null)"
+
+print-config:
+	$(Q)echo "CC       = $(CC)"
+	$(Q)echo "CFLAGS   = $(CFLAGS)"
+	$(Q)echo "LDFLAGS  = $(LDFLAGS)"
+	$(Q)echo "LDLIBS   = $(LDLIBS)"
+	$(Q)echo "NO_SLIRP = $(NO_SLIRP)"
+	$(Q)echo "SRCS     = $(words $(SRCS)) ファイル"
+
+# ---------------------------------------------------------------------------
+# インストール
+#   PREFIX=/usr/local が既定。config.ini は上書きしない
+#   (既に運用中の設定を壊さないため)。
+# ---------------------------------------------------------------------------
+PREFIX  ?= /usr/local
+DESTDIR ?=
+
+install: $(TARGET)
+	install -d $(DESTDIR)$(PREFIX)/bin
+	install -m 0755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/$(TARGET)
+	install -m 0755 scripts/setup-gadget-linux.sh \
+	        $(DESTDIR)$(PREFIX)/bin/vmodem-setup-gadget
+	install -d $(DESTDIR)/etc/vmodem
+	@if [ -f $(DESTDIR)/etc/vmodem/config.ini ]; then \
+	    echo "  既存の /etc/vmodem/config.ini は上書きしません"; \
+	else \
+	    install -m 0644 config.ini $(DESTDIR)/etc/vmodem/config.ini; \
+	fi
+	@echo ""
+	@echo "インストール完了。"
+	@echo "  USB ガジェット設定 : sudo vmodem-setup-gadget"
+	@echo "  起動               : sudo $(PREFIX)/bin/vmodem \\"
+	@echo "                          --config /etc/vmodem/config.ini \\"
+	@echo "                          --port /dev/ttyGS0 --net slirp -v"
+
+uninstall:
+	rm -f $(DESTDIR)$(PREFIX)/bin/$(TARGET)
+	rm -f $(DESTDIR)$(PREFIX)/bin/vmodem-setup-gadget
+	@echo "/etc/vmodem は残しました (設定ファイルの保護)"
+
+# udev ルールと systemd unit の配置。
+# 詳細は scripts/99-vmodem.rules 冒頭を参照。
+gadget-install:
+	install -m 0644 scripts/99-vmodem.rules \
+	        $(DESTDIR)/etc/udev/rules.d/99-vmodem.rules
+	install -m 0644 scripts/vmodem.service \
+	        $(DESTDIR)/etc/systemd/system/vmodem.service
+	@echo "配置しました。有効化するには:"
+	@echo "  sudo udevadm control --reload-rules"
+	@echo "  sudo systemctl daemon-reload"
+
+# ---------------------------------------------------------------------------
+clean:
+	rm -rf $(BUILD) $(TARGET)
+
+distclean: clean
+	rm -f vmodem.log vmodem-dump.wav
+
+help:
+	@echo "VModem Linux ビルド (Khadas VIM1 / Armbian)"
+	@echo ""
+	@echo "ターゲット:"
+	@echo "  all (既定)      vmodem をビルド"
+	@echo "  tests           全テストをビルド"
+	@echo "  check           全テストをビルドして実行"
+	@echo "  check-deps      依存ライブラリの有無を確認"
+	@echo "  print-config    実際に使うフラグを表示"
+	@echo "  install         $(PREFIX)/bin へインストール"
+	@echo "  uninstall       アンインストール"
+	@echo "  gadget-install  udev ルールと systemd unit を配置"
+	@echo "  clean           build/ と vmodem を削除"
+	@echo "  distclean       ログ・WAV も削除"
+	@echo ""
+	@echo "変数:"
+	@echo "  NO_SLIRP=1      libslirp を使わない (--net loopback / none のみ)"
+	@echo "  V=1             コマンドラインを表示"
+	@echo "                  (NO_ALSA は無い。libasound2-dev は必須。"
+	@echo "                   音を切るなら --quiet / audio_enable=false)"
+	@echo "  CROSS_COMPILE=  クロスビルド (例 aarch64-linux-gnu-)"
+	@echo "  PREFIX=         インストール先 (既定 /usr/local)"
+	@echo ""
+	@echo "依存:"
+	@echo "  sudo apt install build-essential libasound2-dev libslirp-dev"
+
+# ヘッダ依存 (-MMD -MP の出力)。初回は存在しないので - で無視。
+-include $(DEPS)
+-include $(patsubst $(BUILD)/%.o,$(BUILD)/t/%.d,$(OBJS))

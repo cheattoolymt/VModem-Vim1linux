@@ -1,6 +1,12 @@
 # ビルド成果物
 build/
 build-*/
+
+# Linux ビルドの実行ファイル (Makefile.linux の TARGET)
+#   拡張子が無いので明示的に書く必要がある。
+#   先頭の "/" でリポジトリ直下だけを対象にする。
+/vmodem
+*.d
 *.o
 *.obj
 *.exe

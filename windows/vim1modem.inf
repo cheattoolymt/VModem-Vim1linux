@@ -1,0 +1,211 @@
+; ===========================================================================
+;  vim1modem.inf -- Installation file that makes the Khadas VIM1 VModem
+;                   appear as a COM port on Windows (Step 8-a)
+;
+;  Target device : Linux USB Gadget CDC-ACM running on the VIM1
+;                  (created by scripts/setup-gadget-linux.sh)
+;                  VID 0x1209 / PID 0x0001
+;  Driver loaded : usbser.sys (the USB serial driver shipped with Windows)
+;  Supported OS  : Windows XP SP2 / SP3 / 2003 / Vista / 7 / 8.x
+;                  (Windows 10 1709 and later need no INF at all: the
+;                   in-box usbser.sys binds automatically, so this file
+;                   is unnecessary there.)
+;
+;  NOTE ON LANGUAGE
+;  ----------------
+;  This file is intentionally written in ASCII only, with no Japanese text.
+;  The XP setupapi reads INF files as ANSI using the system code page, so
+;  UTF-8 multi-byte comments can be mangled and in the worst case break
+;  parsing. The Japanese design notes for this file live in
+;  README.md / docs, not here. tests/test_linux_step78.c enforces the
+;  ASCII-only rule automatically.
+;
+;  ---------------------------------------------------------------------------
+;  WHY XP SP2 OR LATER
+;
+;  CDC-ACM is a composite function: one Communication interface
+;  (class 0x02) plus one Data interface (class 0x0A) together form a
+;  single logical device. Which two interfaces belong together is
+;  declared by an IAD (Interface Association Descriptor).
+;
+;  IAD parsing was added to Windows XP in SP2. XP SP1 and Windows 2000
+;  do not read IADs, so they only look at interface 0 and end up placing
+;  an unknown device under "USB Composite Device".
+;
+;  Getting the host to read the IAD also requires the *device* to declare
+;    bDeviceClass    = 0xEF
+;    bDeviceSubClass = 0x02
+;    bDeviceProtocol = 0x01
+;  which scripts/setup-gadget-linux.sh writes into configfs. Neither side
+;  alone is enough. Before editing this INF, confirm the gadget side with
+;    sudo bash scripts/setup-gadget-linux.sh status
+;  and check that bDeviceClass reads 0xef.
+;
+;  ---------------------------------------------------------------------------
+;  ABOUT DRIVER SIGNING
+;
+;  No .cat (catalog) file is shipped with this INF, so it is unsigned.
+;
+;   * XP / 2003 / Vista(32-bit) / 7(32-bit) / 8.x(32-bit)
+;       Installation shows a warning that the driver is unsigned or has
+;       not passed Windows Logo testing. Choose "Continue Anyway" on XP,
+;       or "Install this driver software anyway" on Vista and later.
+;       If System Properties -> Hardware -> Driver Signing is set to
+;       "Block", change it to "Warn" or "Ignore" first.
+;
+;   * 64-bit Vista and later
+;       Kernel-mode driver signing is enforced, so this INF alone will
+;       not install. For testing, disable driver signature enforcement
+;       (F8 at boot, or bcdedit /set testsigning on). Note that the
+;       usbser.sys binary being loaded is itself Microsoft-signed, so on
+;       Windows 10 1709 and later the device is recognised with no INF.
+;
+;   * The main use case here is a 32-bit XP dial-up client, where being
+;       unsigned is rarely a problem in practice.
+;
+;  ---------------------------------------------------------------------------
+;  HOW TO USE
+;
+;   1) On the VIM1, bring up the gadget and start vmodem:
+;        sudo bash scripts/setup-gadget-linux.sh
+;        sudo ./vmodem --port /dev/ttyGS0 --net slirp -v
+;   2) Connect the USB-C port to the Windows machine.
+;   3) In the Found New Hardware Wizard, choose
+;      "Install from a list or specific location" and point it at the
+;      folder containing this file.
+;   4) Device Manager -> Ports (COM & LPT) shows
+;      "VIM1 Dialup Modem (COMx)". Note the COM number.
+;   5) Control Panel -> Phone and Modem Options -> Modems -> Add
+;      -> "Don't detect my modem" -> (Standard Modem Types)
+;      -> "Standard 33600 bps Modem", assigned to COMx.
+;   6) Network Connections -> New Connection -> Dial-up, using the phone
+;      number configured in config.ini.
+;
+;  ---------------------------------------------------------------------------
+;  ABOUT THE VID/PID
+;
+;  1209:0001 is the pid.codes *Test PID*, reserved for private in-house
+;  testing. It must not be used in anything you distribute. Once you have
+;  obtained your own PID, update the VID_/PID_ values in the [DeviceList*]
+;  sections below to match. On the gadget side the same value is
+;  overridden with the VM_PID environment variable.
+; ===========================================================================
+
+[Version]
+Signature   = "$Windows NT$"
+Class=Ports
+ClassGuid   = {4D36E978-E325-11CE-BFC1-08002BE10318}
+Provider    = %PROVIDER%
+; Keep DriverVer at an XP-era date on purpose. A date newer than the
+; in-box usbser.inf can make this INF win the ranking in situations
+; where the in-box driver would have been the better match.
+DriverVer   = 04/01/2009,5.1.2600.0
+; CatalogFile is deliberately omitted: no .cat is shipped (unsigned).
+
+[Manufacturer]
+%PROVIDER% = DeviceList, NT, NTamd64
+
+; ---------------------------------------------------------------------------
+;  Hardware IDs
+;
+;  For an IAD composite device Windows creates a child device per
+;  function, and its hardware ID carries &MI_xx (Multiple Interface).
+;  The CDC-ACM communication interface is number 0, so it appears as
+;  &MI_00. If the device is instead enumerated as a single-function
+;  device (no IAD), no &MI_xx suffix is present. Both forms are listed
+;  so either enumeration path binds. MI_02 is included as well, to cover
+;  a second ACM function if one is ever added to the gadget.
+; ---------------------------------------------------------------------------
+
+; Windows 2000 / XP / 2003 / Vista / 7 / 8 (32-bit)
+[DeviceList.NT]
+%DESCRIPTION% = DriverInstall.NT, USB\VID_1209&PID_0001&MI_00
+%DESCRIPTION% = DriverInstall.NT, USB\VID_1209&PID_0001
+%DESCRIPTION% = DriverInstall.NT, USB\VID_1209&PID_0001&MI_02
+
+; 64-bit (Vista and later). See the signing note at the top of this file.
+[DeviceList.NTamd64]
+%DESCRIPTION% = DriverInstall.NTamd64, USB\VID_1209&PID_0001&MI_00
+%DESCRIPTION% = DriverInstall.NTamd64, USB\VID_1209&PID_0001
+%DESCRIPTION% = DriverInstall.NTamd64, USB\VID_1209&PID_0001&MI_02
+
+; The undecorated [DeviceList] is a fallback for older setupapi versions
+; (Windows 2000) that do not honour the TargetOSVersion decorations.
+[DeviceList]
+%DESCRIPTION% = DriverInstall.NT, USB\VID_1209&PID_0001&MI_00
+%DESCRIPTION% = DriverInstall.NT, USB\VID_1209&PID_0001
+
+[DestinationDirs]
+DefaultDestDir = 12          ; %SystemRoot%\system32\drivers
+
+; ---------------------------------------------------------------------------
+;  32-bit install sections
+; ---------------------------------------------------------------------------
+[DriverInstall.NT]
+; mdmcpq.inf is the in-box "modem composite device" INF. Including it
+; borrows the standard usbser boilerplate (serial port property page
+; registration and so on). Writing all of that by hand tends to break
+; across XP service pack differences.
+include     = mdmcpq.inf
+CopyFiles   = DriverCopyFiles.NT
+AddReg      = DriverInstall.NT.AddReg
+
+[DriverCopyFiles.NT]
+; 0x20 = COPYFLG_NOVERSIONCHECK
+;   usbser.sys ships with the OS, so the existing copy is used as is.
+;   Because no usbser.sys is provided alongside this INF, there is
+;   deliberately no [SourceDisksFiles] section.
+usbser.sys,,,0x20
+
+[DriverInstall.NT.AddReg]
+HKR,,DevLoader,,*ntkern
+HKR,,NTMPDriver,,usbser.sys
+; Show the serial port property page (bits per second and so on).
+HKR,,EnumPropPages32,,"MsPorts.dll,SerialPortPropPageProvider"
+
+[DriverInstall.NT.Services]
+AddService = usbser, 0x00000002, DriverService.NT
+; 0x00000002 = SPSVCINST_ASSOCSERVICE (associate this service)
+
+[DriverService.NT]
+DisplayName    = %SERVICE%
+ServiceType    = 1            ; SERVICE_KERNEL_DRIVER
+StartType      = 3            ; SERVICE_DEMAND_START
+ErrorControl   = 1            ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\usbser.sys
+LoadOrderGroup = Base
+
+; ---------------------------------------------------------------------------
+;  64-bit install sections
+; ---------------------------------------------------------------------------
+[DriverInstall.NTamd64]
+include     = mdmcpq.inf
+CopyFiles   = DriverCopyFiles.NTamd64
+AddReg      = DriverInstall.NTamd64.AddReg
+
+[DriverCopyFiles.NTamd64]
+usbser.sys,,,0x20
+
+[DriverInstall.NTamd64.AddReg]
+HKR,,DevLoader,,*ntkern
+HKR,,NTMPDriver,,usbser.sys
+HKR,,EnumPropPages32,,"MsPorts.dll,SerialPortPropPageProvider"
+
+[DriverInstall.NTamd64.Services]
+AddService = usbser, 0x00000002, DriverService.NTamd64
+
+[DriverService.NTamd64]
+DisplayName    = %SERVICE%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %12%\usbser.sys
+LoadOrderGroup = Base
+
+; ---------------------------------------------------------------------------
+;  Strings
+; ---------------------------------------------------------------------------
+[Strings]
+PROVIDER    = "VModem Project"
+DESCRIPTION = "VIM1 Dialup Modem"
+SERVICE     = "USB Serial Emulation Driver (usbser.sys)"
