@@ -30,8 +30,8 @@ Windows 版は com0com の仮想 COM ペアを「電話線」に使っていま�
 
 ## 移植の進捗
 
-本リポジトリは移植手順書 (`linux_port_instructions.md`) の **Step 0〜5 のみ**を
-実装した段階です。**Step 6 以降は意図的に未着手**です。
+本リポジトリは移植手順書 (`linux_port_instructions.md`) の **Step 0〜6 のみ**を
+実装した段階です。**Step 7 以降は意図的に未着手**です。
 
 | Step | 内容 | 状態 |
 |---|---|---|
@@ -41,7 +41,7 @@ Windows 版は com0com の仮想 COM ペアを「電話線」に使っていま�
 | 3 | `src/main.c` のシグナル処理 | ✅ 完了 |
 | 4 | `src/core/vm_log.c` の POSIX 対応 | ✅ 完了 |
 | 5 | `src/net/vm_nat.c` の時計 / `vm_hostroute_linux.c` (新規) | ✅ 完了 |
-| 6 | `src/net/vm_nat_slirp.c` (libslirp の POSIX 対応) | ⬜ 未着手 |
+| 6 | `src/net/vm_nat_slirp.c` (libslirp の POSIX 対応) | ✅ 完了 |
 | 7 | `Makefile.linux` | ⬜ 未着手 |
 | 8 | `scripts/setup-gadget-linux.sh` / `windows/vim1modem.inf` | ⬜ 未着手 |
 
@@ -49,8 +49,9 @@ Step 3・4 が入ったので、**libslirp を使わない構成 (`--net none` /
 `--net loopback`) なら Linux 上で実際に起動・常駐・正常終了できます**。
 Step 5 で `src/net/` の Windows 依存のうち **時計 (`GetTickCount64`) と
 外向きアドレスの検出 (`GetAdaptersAddresses`)** が解消されました。
-`--net slirp` にはまだ `GetProcAddress` / `WSAPOLLFD` 前提のコードが
-`vm_nat_slirp.c` に残っているため、**Step 6 が必要**です。
+Step 6 で `vm_nat_slirp.c` の `GetProcAddress` / `WSAPOLLFD` 依存が解消され、
+**`--net slirp` も Linux でビルド・リンク・起動できます**
+(Debian/Ubuntu の libslirp 4.8 と同梱ヘッダ 4.9.3 の組み合わせでも動作)。
 
 ```bash
 # Step 5 までで動く構成の例 (PTY をモデム側の回線として使う)
@@ -404,8 +405,8 @@ off += snprintf(line + off, sizeof(line) - off, ...);
 
 ## Step 5: NAT の時計と外向きアドレス検出
 
-Step 5 の成果物は 3 つです。**`vm_nat_slirp.c` 本体の移植 (Step 6) には
-手を付けていません。**
+Step 5 の成果物は 3 つです。`vm_nat_slirp.c` 本体の移植は Step 6 で
+行いました (下の「Step 6」節を参照)。
 
 | 対象 | 変更 |
 |---|---|
@@ -719,6 +720,344 @@ POSIX 向けに書き直した後も**全項目そのまま成功**します。`
 
 ---
 
+## Step 6: `vm_nat_slirp.c` の Linux 対応
+
+Step 6 の要求は 3 つ (6-a / 6-b / 6-c) で、**すべて `src/net/vm_nat_slirp.c`
+1 ファイルの中で完結します**。新規ファイルは作っていません。
+
+| 小項目 | 指示書の要求 | 実際に何が問題だったか |
+|---|---|---|
+| 6-a | poll 抽象の確認。「WSAPoll 専用フィルタが Linux 側に影響しないか確認」 | **影響していた**。`slirp_to_native()` の `#ifdef _WIN32` が PRI の 1 行にしか掛かっておらず、ERR/HUP を落とす Windows のための制約が POSIX にも適用されていた |
+| 6-b | `GetProcAddress` の Linux 対応 | **Linux でリンクが通らなかった**。`slirp_pollfds_fill_socket` を静的参照していたため、apt の libslirp 4.8 に対して `undefined reference` |
+| 6-c | Winsock 型の除去 | 型の隔離自体は概ね出来ていたが、**EINTR 未対応**と**`native == 0` の Windows 用細工が POSIX に漏れていた** |
+
+### 6-a: WSAPoll 専用フィルタが Linux 側に漏れていた
+
+移植前の `slirp_to_native()` はこうなっていました。
+
+```c
+if (ev & SLIRP_POLL_IN)  r |= POLLIN;
+if (ev & SLIRP_POLL_OUT) r |= POLLOUT;
+#ifdef _WIN32
+if (ev & SLIRP_POLL_PRI) r |= POLLRDBAND;   /* ← ここだけ分岐 */
+#else
+if (ev & SLIRP_POLL_PRI) r |= POLLPRI;
+#endif
+/* SLIRP_POLL_ERR / SLIRP_POLL_HUP は意図的に無視する */
+```
+
+最後の「ERR / HUP を無視する」は **Windows の WSAPoll が
+`events` にこれらを立てると `WSAEINVAL` で即死するから**という
+Windows 固有の理由です。ところが `#ifdef` の外にあるため、
+Linux ビルドでも ERR / HUP が落ちていました。
+
+POSIX の `poll(2)` はこれらを `events` で単に無視するだけで
+エラーにしないので、落とす必要がありません。落とすと 2 つ損をします。
+
+1. **`events` が空になる場合の意味が変わる。** libslirp が
+   `SLIRP_POLL_ERR` 単独を要求すると変換結果が 0 になり、
+   後述の `native == 0` の細工で **`POLLIN` にすり替えられていました**。
+   「接続失敗の検出」が「読み取り可能待ち」に化けるという致命的な誤りです。
+2. **デバッグ時に libslirp の意図が消える。** poll をダンプしても
+   何を待っているのか分からず、「繋がらない」の調査時間が伸びます。
+
+そこで **関数ごと Windows 版と POSIX 版に完全に分割**しました。
+POSIX 版は libslirp が要求した通り全ビットを素通しします。これは
+QEMU の `net/slirp.c` (`slirp_poll_to_gio`) が IN/OUT/PRI/ERR/HUP を
+すべて通しているのと同じ方針で、libslirp が想定している唯一の正しい
+使い方です。
+
+`poll(2)` が本当に `POLLERR|POLLHUP` を拒否しないことは
+`tests/test_linux_step6.c` で実測しています (憶測にしていません)。
+
+```
+[ OK ] events=POLLIN|POLLERR|POLLHUP|POLLPRI で poll が成功する (rc=1 errno=0)
+[ OK ] ERR 単独が POLLERR になる (0 に潰れない = WSAPoll フィルタ非適用)
+```
+
+### 6-b: `GetProcAddress` → `dlsym`。Linux ではリンクすら通っていなかった
+
+移植前は「ヘッダのバージョンで静的に分岐」していました。
+
+```c
+#ifdef _WIN32
+    /* GetModuleHandleA + GetProcAddress */
+#elif VM_SLIRP_HAVE_SOCKET_API              /* = SLIRP_CHECK_VERSION(4,9,0) */
+    g_slirp_abi.fill_socket = slirp_pollfds_fill_socket;   /* ★静的参照★ */
+#endif
+```
+
+`SLIRP_CHECK_VERSION` が見るのは **ヘッダ**のバージョンです。本
+リポジトリは `include/libslirp.h` に **4.9.3** を同梱しているので常に真に
+なりますが、Debian/Ubuntu が提供する `libslirp.so.0` は **4.8.0** で、
+そこに `slirp_pollfds_fill_socket` は存在しません。結果:
+
+```
+/usr/bin/ld: /tmp/cc3UPCy1.o: in function `slirp_be_open':
+vm_nat_slirp.c:(.text+0x7b3): undefined reference to `slirp_pollfds_fill_socket'
+collect2: error: ld returned 1 exit status
+```
+
+移植前のコメントには「POSIX では ELF の遅延束縛のおかげで起動時全滅は
+起きない」と書かれていましたが、**これは事実誤認**です。遅延束縛は
+実行時の解決を遅らせるだけで、**リンク時の未定義参照は静的リンカが
+その場で弾きます**。
+
+Windows は DLL を同梱できるのでヘッダと DLL が必ず一致しますが、Linux は
+ディストリのライブラリを使うのでずれる方が普通です。そこで
+`dlsym(RTLD_DEFAULT, ...)` による実行時解決に置き換えました。
+
+```c
+union { void *ptr; vm_fill_socket_fn fn; } u;
+u.ptr = dlsym(RTLD_DEFAULT, "slirp_pollfds_fill_socket");
+g_slirp_abi.fill_socket = u.fn;   /* 無ければ NULL = 旧 API へ */
+```
+
+| 選択 | 理由 |
+|---|---|
+| `dlsym` (静的分岐でなく) | ヘッダとライブラリのバージョンがずれても動く。Linux では常態 |
+| `RTLD_DEFAULT` (`dlopen` でなく) | `dlopen("libslirp.so.0", RTLD_NOLOAD)` は libslirp が未参照だと NULL を返す。`RTLD_DEFAULT` はプロセスのグローバルスコープを検索するので確実 |
+| `union` 経由のキャスト | ISO C は `void*` ↔ 関数ポインタの直接変換を未定義とする。POSIX.1-2008 は `dlsym` の RATIONALE でこの回避策を明示的に要求している |
+| `_GNU_SOURCE` を先頭で定義 | `RTLD_DEFAULT` / `RTLD_NOLOAD` は GNU 拡張。`-std=c99` (`__STRICT_ANSI__`) だと `<dlfcn.h>` から見えなくなる |
+
+**リンク時に `-ldl` が必要です** (指示書の要求どおり)。glibc 2.34 以降は
+libdl が libc に統合されたので実質 no-op ですが、それ以前や musl では
+必須なので必ず付けてください。
+
+これで **同梱ヘッダ 4.9.3 + apt のライブラリ 4.8.0** という
+ずれた組み合わせでもリンクが通り、実行時に `NULL` を得て
+`slirp_pollfds_fill()` (旧 API) へフォールバックします。
+
+```
+INF nat(slirp): libslirp 4.8.0 を検出 (共有ライブラリ) cfg.version 上限=5,
+    fill=slirp_pollfds_fill (旧API・fd は int に切り詰められる)
+INF nat(slirp): 旧 API を使うが Linux の fd は int なので
+    切り詰めの問題は起きない
+```
+
+旧 API の `int` 切り詰めは **Win64 (LLP64, `SOCKET` = 8 バイト) 固有の
+問題**で、Linux では `fd` がそもそも `int` なので情報が落ちません。
+つまり 4.8 環境で旧 API へ落ちるのは実害のない正常な経路です。
+
+### 6-c: Winsock 型の隔離 (機械的に検証)
+
+指示書の「`WSAPOLLFD` / `SOCKET` / `INVALID_SOCKET` が
+`#ifdef _WIN32` で正しく隔離されているか確認」は、目視ではなく
+**プリプロセッサ出力を検査**して確定させました。
+
+```bash
+$ gcc -std=c99 -Iinclude -Isrc/net -DVMODEM_HAVE_LIBSLIRP \
+      -E src/net/vm_nat_slirp.c |
+  grep -E 'WSAPOLLFD|INVALID_SOCKET|WSAPoll|UINT_PTR|SOCKET_ERROR|GetProcAddress|GetModuleHandle|closesocket|WSAGetLastError|\bSOCKET\b'
+$          # 一致 0 件
+```
+
+Linux ビルドの翻訳単位から Winsock 由来の識別子が完全に消えています。
+隔離箇所は 4 つだけです。
+
+1. poll 抽象ブロック (`WSAPOLLFD` / `WSAPoll` / `POLL*` 定数の補完)
+2. `VM_SLIRP_HAVE_SOCKET_API == 0` 時の `vm_slirp_socket_t` 補完
+3. `slirp_to_native()` (6-a で完全分離)
+4. `cb_add_poll_fd()` の `UINT_PTR` キャスト (`_WIN32` 内のみ)
+
+### 6-c: `EINTR` — Linux でだけ起きる、追いにくい通信破壊
+
+`src/main.c` の `install_signal_handlers()` は **意図的に `SA_RESTART` を
+付けていません** (付けるとシリアル読取の `read()` が自動再開し、Ctrl-C の
+反応がタイムアウト 200ms 分遅れるため)。その代償として、シグナル配送中に
+走っていた `poll()` は `-1` / `EINTR` で戻ります。
+
+Windows の `WSAPoll` に `EINTR` は無いので、移植前のコードには
+この処理がありません。放置すると:
+
+```
+rc < 0  →  slirp_pollfds_poll(slirp, select_error = 1, ...)
+        →  libslirp 側は if (!select_error) { ...受信処理... }
+        →  その周回のソケット I/O が丸ごとスキップされる
+```
+
+送信 (`slirp_input` 経由) だけは `poll` と無関係に動くので、症状は
+**「時々パケットを落とす / 転送が固まる」**という極めて追いにくい形に
+なります。`SIGWINCH` / `SIGCHLD` / プロファイラの `SIGPROF` /
+デバッガの停止再開でも普通に起きます。
+
+対策として `EINTR` を **タイムアウトと同一視** (`rc = 0`) し、
+`revents` をゼロクリアしてから libslirp に渡します。
+ループで再試行しない理由は、**終了シグナルを受けた時にそこから
+抜け出せなくなり、`SA_RESTART` を付けないという `main.c` の設計と
+矛盾する**からです。呼び出し元 (`vm_modem.c`) は 20ms 周期の
+ポーリングループなので、待ち時間が短くなるのは無害です。
+
+`EINTR` 以外の `poll` 失敗 (`EFAULT` / `EINVAL` / `ENOMEM`) は復旧
+不能なので、`select_error` として伝えつつ**最初の 1 回だけログ**を出します
+(無音で止まるのを防ぎ、かつログを溢れさせない)。
+
+`EINTR` が実際に起きることもテストで実測しています。
+
+```
+[ OK ] poll が EINTR で戻った (50 ms 経過, 要求 1000 ms)
+[ OK ] タイムアウト前に戻っている -> 自動再開していない
+```
+
+### 6-c: `native == 0` の Windows 用細工を POSIX から外した
+
+`add_poll_common()` には OS 共通でこう書かれていました。
+
+```c
+if (native == 0)
+    native = POLLIN;
+```
+
+Windows では `WSAPoll` に `events == 0` を渡すと実装によって
+`WSAEINVAL` を返すため、ダミーが必要です。しかし POSIX では
+`poll(events == 0)` は正常に動き、`POLLERR` / `POLLHUP` / `POLLNVAL` は
+`revents` に載ります。ここで勝手に `POLLIN` を立てると、
+
+- libslirp の意図と違う「読み取り可能待ち」にすり替わる
+- 読めるデータがある fd で `poll` が即戻りして **busy loop** になる
+
+という二重の劣化を招きます。よって POSIX では**何もしない**のが正しく、
+`#ifdef _WIN32` で囲みました。ただし `events == 0` が来た事実は
+「繋がらない」時の手掛かりになるので、**一度だけ** 警告を出します。
+
+### 6-c: `outbound_addr` の Linux での再検証
+
+`outbound_addr` はもともと **Windows の RAS がダイアルアップ確立時に
+デフォルト経路を奪う**問題への対策です (自分のプロセスが
+`sendto(8.8.8.8)` すると自分の仮想回線に送り返され `WSAENETUNREACH`)。
+Linux では前提が違うので、同じコードで害が無いかを実測しました。
+
+| 項目 | Windows | Linux |
+|---|---|---|
+| デフォルト経路を奪う主体 | RAS が既定で奪う | pppd の `defaultroute` だが**本実装は pppd を使わない** → 経路表は無変更 |
+| `bind()` の意味 | strong host model (Vista 以降) なので**出力 IF も固定される** | weak host model なので**送信元 IP の固定のみ**。出力 IF は経路表で決まる |
+| 必要性 | **必須** | 不要。ただし有害でもない (eth0 / wlan0 併存時に送信元が安定する) ので有効のまま |
+
+実測で確認した 3 点:
+
+1. 実 NIC の IP への `bind()` は成功する。
+2. 存在しない IP (`192.168.77.55`) への `bind()` は
+   **`errno 99` = `EADDRNOTAVAIL`** で失敗する。
+   → DHCP で NIC の IP が変わった後は libslirp が古い `outbound_addr` を
+   持ち続けるため、**全ての新規接続が即エラー**になります。
+   切り分けは `strace -e trace=bind` か起動ログの bind 先の確認。
+3. NIC の IP に bind した UDP ソケットから `127.0.0.1` へ送っても
+   応答が返る。
+   → libslirp の DNS 中継 (`sotranslate_out4` が `vnameserver` 宛を
+   host の resolver へ差し替える) が `127.0.0.53` (systemd-resolved) でも
+   壊れません。**Linux 移植で最も壊れそうだった箇所**ですが問題無しです。
+
+Linux で「繋がらない」時に見る順番:
+
+1. 起動ログに bind 先 IP が出ているか
+2. `ip route get 8.8.8.8` の `src` がその IP と一致するか
+3. 一致しないなら `vm_hostroute_pick_outbound_ip()` の
+   `connect(2)` プローブが別 IF を選んでいる
+
+### `timer_fires == 0` は正常。異常と誤認しないこと
+
+指示書は「インターネットに出られない時は `timer_fires` を確認せよ」と
+書いていますが、**この構成では 0 が正常**です。libslirp が `timer_new` を
+呼ぶ箇所は upstream 全体で 1 つだけです。
+
+```c
+/* src/ip6_icmp.c  icmp6_post_init() */
+if (!slirp->in6_enabled) {
+    return;                                       /* ← ここで即 return */
+}
+slirp->ra_timer = slirp_timer_new(slirp, SLIRP_TIMER_RA, NULL);
+```
+
+つまり **IPv6 Router Advertisement 専用**です。本実装は IPV6CP を
+Reject して `cfg.in6_enabled = false` にしているので、タイマは 1 つも
+作られません (4.8.0 / master 双方のソースで確認済み)。
+
+切り分けはこう読みます。
+
+| 観測 | 意味 |
+|---|---|
+| `timer_fires == 0` かつ `poll > 0` | **正常**。別の原因を疑う |
+| `poll == 0` | poll ループまで到達していない |
+| `eintr` が `poll` と同オーダーで増える | シグナル嵐。6-c の罠を踏んでいる |
+
+終了ログにこの 3 つを出すようにしました。
+
+```
+INF nat(slirp): 終了 poll=10 timer_fires=0 eintr=0
+    (timer_fires=0 は IPv6 無効時の正常値)
+```
+
+### Step 6 の新規テスト
+
+`tests/test_linux_step6.c` が Step 6-a / 6-b / 6-c の実行時検証を行います
+(**42 項目すべて成功 / 失敗 0 / 省略 0**)。
+
+```bash
+gcc -O2 -std=c99 -Wall -Wextra -Iinclude -Isrc/net \
+    -DVMODEM_HAVE_LIBSLIRP \
+    tests/test_linux_step6.c \
+    src/net/vm_nat.c src/net/vm_nat_loopback.c src/net/vm_nat_slirp.c \
+    src/net/vm_eth.c src/net/vm_hostroute_linux.c \
+    src/core/vm_log.c src/core/vm_types.c \
+    -lslirp -lpthread -ldl -o test_linux_step6
+./test_linux_step6
+```
+
+**このテストがリンクできること自体が 6-b の検証です。** 移植前は
+同じコマンドが `undefined reference to 'slirp_pollfds_fill_socket'` で
+失敗しました。
+
+Step 6 の成果物は「`#ifdef` の掛け方」がほとんどで実行時に観測できる値が
+少ないため、検証を 3 層に分けています。
+
+| 層 | 何を検証するか |
+|---|---|
+| ビルド時に確定する事実 | テスト側が同じ `#ifdef` 規則を再現し、写像表を突き合わせる。実装を変えたらテストも落ちるべきなので**規則の複製が正しい** |
+| ライブラリへ問い合わせる事実 | `dlsym` / `slirp_version_string()` で ABI を実測。バージョンと `fill_socket` の有無の**整合性**だけを判定 (値は環境依存なので assert しない) |
+| OS の振る舞い | `poll(2)` が `events` の ERR/HUP を本当に無視するか、`EINTR` が本当に起きるか、`bind` の意味論。**憶測にせず実測** |
+
+検証内容:
+
+| 節 | 検証する事 |
+|---|---|
+| 6-a-1 | libslirp が実際に要求する 4 種の組み合わせが素通しされる事 / **ERR 単独・HUP 単独が 0 に潰れない**事 (= WSAPoll フィルタ非適用) / `POLLNVAL` は `events` に立たない事 |
+| 6-a-2 | `events=POLLIN|POLLERR|POLLHUP|POLLPRI` で `poll` が**成功する**事 (WSAPoll は `WSAEINVAL`) / `events=0` でも失敗しない事 |
+| 6-a-3 | `events=0` の fd でも切断が `revents` に載る事 = 補正しなくても取りこぼさない事 |
+| 6-b-1 | `dlsym(RTLD_DEFAULT, ...)` が解決できる事 / **ライブラリのバージョンと `fill_socket` の有無が整合する**事 / `union` キャストが成立する事 |
+| 6-b-2 | `dlopen(RTLD_NOLOAD)` ではなく `RTLD_DEFAULT` を選んだ根拠の記録 |
+| 6-b-3 | glibc のバージョンから `-ldl` の必要性を判定 |
+| 6-c-1 | `struct pollfd.fd` が `int` である事 / `slirp_os_socket` が Linux では `int` である事 = **旧 API の切り詰めが無害**である事 / fd が `int` に収まる小さな正整数である事 |
+| 6-c-2 | 子プロセスから 50ms 後に `SIGUSR1` を送り、**`SA_RESTART` 無しの `poll` が実際に `EINTR` で戻る**事 / タイムアウト前に戻る事 |
+| 6-c-3 | `poll` 失敗時の `revents` が信用できない事 = `EINTR` 時にゼロクリアが必要な事 |
+| 6-c-4 | 外向き IP に `bind` できる事 / **存在しない IP への `bind` が `EADDRNOTAVAIL(99)`** になる事 |
+| 6-c-5 | NIC bind 済みソケットから `127.0.0.1` へ**実際に届く**事 = libslirp の DNS 中継が壊れない事 |
+| 6-c-6 | `vm_nat_create(SLIRP)` が成功する事 (= `slirp_new` が `cfg.version` を受け付けた = ABI 整合) / 20ms × 10 回 `poll` を回せる事 / **`timers_active == 0`** である事 |
+| 6-c-7 | 20 回の `poll` に 1 回あたり 0.5ms 以上掛かる事 = **timeout の下限クランプが効いていて busy loop になっていない**事 |
+| 範囲 | `Makefile.linux` / `scripts/setup-gadget-linux.sh` / `windows/vim1modem.inf` が**存在しない**事 (Step 7 以降未着手の明示) |
+
+権限が足りない項目は FAIL ではなく SKIP にします (sandbox では ICMP
+ソケットが作れない等)。環境依存の値 (NIC の IP、libslirp のバージョン) は
+assert せず、「どの環境でも成り立つ性質」だけを判定します。
+
+Step 6 の変更が既存のテストを壊していない事も確認済みです
+(`tests/test_nat.c` **92 項目成功**、`tests/test_linux_step5.c`
+**29 項目成功**)。
+
+### Step 6 で触っていないもの
+
+指示書の Step 7 以降には**一切手を付けていません**。
+
+| 成果物 | Step | 状態 |
+|---|---|---|
+| `Makefile.linux` | 7 | ⬜ 未着手 |
+| `scripts/setup-gadget-linux.sh` | 8 | ⬜ 未着手 |
+| `windows/vim1modem.inf` | 8-a | ⬜ 未着手 |
+
+`tests/test_linux_step6.c` の最後にこの 3 ファイルが存在しない事を
+検証する節を入れてあります。
+
+---
+
 ## ビルドに必要なもの
 
 | 項目 | 内容 |
@@ -727,7 +1066,7 @@ POSIX 向けに書き直した後も**全項目そのまま成功**します。`
 | OS | Armbian (Ubuntu Noble ベース) / Linux 6.12 |
 | コンパイラ | gcc 13 以降 (Armbian Noble の既定は gcc 13.2 / 13.3) |
 | 音声 | `libasound2-dev` (alsa-lib) |
-| NAT | `libslirp-dev` (`--net slirp` 用。有効化は Step 6) |
+| NAT | `libslirp-dev` (`--net slirp` 用。Step 6 で有効化済み) |
 
 ```bash
 sudo apt install build-essential libasound2-dev libslirp-dev
@@ -736,10 +1075,13 @@ sudo apt install build-essential libasound2-dev libslirp-dev
 `Makefile.linux` は Step 7 の成果物なのでまだありません。現時点では
 上記の `gcc` コマンドで個別にコンパイル・テストしてください。
 
-なお `libslirp-dev` を入れて `-DVMODEM_HAVE_LIBSLIRP` を付けても、現時点では
-`vm_nat_slirp.c` が `slirp_pollfds_fill_socket` (libslirp 4.9 以降の API) を
-直接参照しているため 4.8 系ではリンクが通りません。この ABI 差の吸収は
-**Step 6 の範囲**なので本段階では手を付けていません。
+`libslirp-dev` を入れて `-DVMODEM_HAVE_LIBSLIRP` を付ければ
+`--net slirp` が使えます。Step 6 で ABI 差を実行時に吸収したので、
+**Debian/Ubuntu の libslirp 4.8 系でもリンクが通ります**
+(同梱ヘッダは 4.9.3 ですが、`slirp_pollfds_fill_socket` は
+`dlsym` で実行時に探すため静的参照が残っていません)。
+`dlsym` を使うので **リンク時に `-ldl` を付けてください**
+(glibc 2.34 以降では no-op ですが、それ以前や musl では必須)。
 
 `/dev/ttyGS0` を開くには USB Gadget の設定が必要ですが、その設定スクリプト
 (`scripts/setup-gadget-linux.sh`) は Step 8 の成果物です。実行時に権限で
@@ -766,7 +1108,7 @@ src/dsp/                 トーン合成・V.8 / V.34 ハンドシェイク音�
 src/modem/               AT コマンド・接続シーケンス・全体制御
 src/net/                 PPP / HDLC / 疑似 Ethernet / NAT
   vm_nat.c               ★NAT 共通・時計 (Step 5 で CLOCK_MONOTONIC 化)
-  vm_nat_slirp.c         libslirp バックエンド (Step 6 で移植予定・未着手)
+  vm_nat_slirp.c         ★libslirp バックエンド (Step 6 で POSIX 対応)
   vm_hostroute.c         外向きアドレス検出 Windows 版
                          ★Step 5 で翻訳単位ごと _WIN32 で囲み Linux から除外
   vm_hostroute_linux.c   ★Linux / getifaddrs 版 (Step 5-a)
@@ -779,6 +1121,7 @@ tests/
   test_linux_port.c      ★Step 1・2 の検証
   test_linux_step34.c    ★Step 3・4 の検証
   test_linux_step5.c     ★Step 5・5-a の検証
+  test_linux_step6.c     ★Step 6-a・6-b・6-c の検証
 docs/README-windows.md   上流 Windows 版の README (libslirp の罠など)
 ```
 
