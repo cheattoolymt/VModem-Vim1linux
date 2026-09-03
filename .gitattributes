@@ -1,0 +1,30 @@
+# Git の改行自動変換で成果物が壊れるのを防ぐための設定。
+#
+# ★なぜ必要か★
+#   .gitattributes が無い状態で、Windows 側のクローンが
+#   core.autocrlf=true (Git for Windows の既定) だと、git は
+#   「テキストらしいファイル」の改行を勝手に変換します。
+#   本リポジトリには、改行の形が仕様に含まれるファイルがあるため、
+#   変換されると壊れます。
+
+# --- Windows 側 INF (Step 8-a) -------------------------------------------
+#   windows/vim1modem.inf は CRLF + ASCII でなければなりません。
+#   Windows XP の setupapi は INF をシステムのコードページで ANSI として
+#   読むため、改行や文字コードが崩れるとパースに失敗し得ます。
+#   -text = 改行変換を一切しない (バイト列をそのまま保存・取り出し)。
+#   これが最も安全で、CRLF が 1 バイトも変わりません。
+*.inf -text
+
+# --- Linux 側スクリプト ---------------------------------------------------
+#   逆に、シェルスクリプトに CRLF が混ざると Linux で
+#     /bin/sh^M: bad interpreter: No such file or directory
+#   になります。常に LF に固定します。
+*.sh    text eol=lf
+*.rules text eol=lf
+*.service text eol=lf
+Makefile* text eol=lf
+
+# --- ソースコード ---------------------------------------------------------
+*.c text eol=lf
+*.h text eol=lf
+*.md text eol=lf

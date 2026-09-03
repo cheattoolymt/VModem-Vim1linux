@@ -1,0 +1,62 @@
+# ===========================================================================
+#  vmodem.service -- VModem を systemd 管理下で常駐させる (Step 8)
+#
+#  配置先: /etc/systemd/system/vmodem.service
+#  反映  : sudo systemctl daemon-reload
+#
+#  起動のきっかけは 2 通り:
+#    (a) 99-vmodem.rules の ENV{SYSTEMD_WANTS} により
+#        /dev/ttyGS0 出現時に udev から自動起動される (既定の運用)
+#    (b) 手動:  sudo systemctl start vmodem
+#    常時有効化: sudo systemctl enable vmodem   ← ガジェットも
+#                自前で用意する場合のみ推奨
+# ===========================================================================
+
+[Unit]
+Description=VModem - ダイアルアップモデムエミュレータ (/dev/ttyGS0)
+Documentation=https://github.com/cheattoolymt/WinDialupEmu
+
+# ポートが無ければ起動しても意味がないので、デバイスの出現を待つ。
+#   /dev/ttyGS0 に対応する device unit 名は dev-ttyGS0.device。
+After=dev-ttyGS0.device
+Requires=dev-ttyGS0.device
+# デバイスが消えたら (ガジェット teardown / USB 抜線) 一緒に止める。
+BindsTo=dev-ttyGS0.device
+
+After=network.target
+
+[Service]
+Type=simple
+
+# --net slirp は raw socket ではなくユーザ空間 NAT なので
+# 本来 root は不要だが、/dev/ttyGS0 の権限と
+# ホスト経路の設定 (Step 5) のために root で動かすのが簡単。
+User=root
+
+# ExecStartPre: ガジェットがまだ無い状況 (手動 start など) でも
+#   立ち上がるように、べき等なセットアップを一度呼ぶ。
+#   既に bind 済みなら何もせず 0 で返る。
+#   '-' 接頭辞により失敗しても起動は続行する。
+ExecStartPre=-/usr/local/bin/vmodem-setup-gadget
+
+ExecStart=/usr/local/bin/vmodem \
+    --config /etc/vmodem/config.ini \
+    --port /dev/ttyGS0 \
+    --net slirp \
+    -v
+
+# vmodem は SIGTERM を受けると PPP を切ってから終了する
+# (Step 3 で実装済みのシグナルハンドラ経路)。
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+Restart=on-failure
+RestartSec=2
+
+# ログは journald へ。
+#   sudo journalctl -u vmodem -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

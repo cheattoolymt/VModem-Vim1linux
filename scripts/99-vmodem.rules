@@ -1,0 +1,49 @@
+# ===========================================================================
+#  99-vmodem.rules -- /dev/ttyGS0 が現れたら VModem を自動起動する (Step 8)
+#
+#  配置先: /etc/udev/rules.d/99-vmodem.rules
+#  反映  : sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+#  ---------------------------------------------------------------------------
+#  ★ 指示書の例をそのまま使えない理由 ★
+#
+#  指示書 Step 8 には例としてこう書かれている:
+#
+#      ACTION=="add", KERNEL=="ttyGS0", RUN+="/usr/local/bin/vmodem-start.sh"
+#
+#  これは「一見動くが必ず途中で殺される」書き方である。
+#  systemd-udevd(8) の RUN の仕様:
+#
+#      「このコマンドから fork された全てのプロセスは、
+#        イベント処理の完了後に無条件に kill される」
+#
+#  つまり RUN+= は *短時間で終わる* 処理専用であり、
+#  VModem のような常駐デーモンを起こす用途には使えない。
+#  起動直後に SIGKILL されるので、症状は
+#  「接続すると一瞬 vmodem が立ち上がってすぐ消える」になる。
+#  (さらに RUN の実行はイベント処理を直列にブロックするため、
+#   長引くと他のデバイスの認識まで遅くなる)
+#
+#  常駐プロセスを起こす正しい方法は ENV{SYSTEMD_WANTS} で
+#  systemd の unit を引っ張ること。udev はトリガを送るだけで
+#  プロセスの寿命は systemd が管理するので kill されない。
+#  ---------------------------------------------------------------------------
+
+# ttyGS0 (USB Gadget CDC-ACM の TTY) が生えたら vmodem.service を起動する。
+#   SUBSYSTEM を絞っているのは、同名の他サブシステムのイベントで
+#   二重に発火させないため。
+ACTION=="add", SUBSYSTEM=="tty", KERNEL=="ttyGS0", \
+    TAG+="systemd", ENV{SYSTEMD_WANTS}+="vmodem.service"
+
+# ttyGS0 が消えたら (ガジェットを teardown した / UDC を unbind した)
+# サービスも止めたい ―― が、udev からの停止指示は用意されていない。
+# vmodem.service 側に BindsTo=/StopWhenUnneeded= を書く方法もあるが、
+# デバイスユニット名が環境依存なので、ここでは
+# 「ポートが消えたら vmodem 自身が終了する」実装に任せる
+# (vmodem は read/poll のエラーで終了し、Restart=on-failure で
+#  再登場を待つ)。
+
+# --- 権限 -------------------------------------------------------------------
+# vmodem を root で動かすなら不要。非 root で動かしたい場合は
+# 下行を有効にして dialout グループに読み書きを許す。
+#ACTION=="add", SUBSYSTEM=="tty", KERNEL=="ttyGS0", GROUP="dialout", MODE="0660"

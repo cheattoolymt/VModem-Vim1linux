@@ -492,8 +492,8 @@ static void test_6b_libdl(void)
 #else
     check(1, "glibc 以外 (musl 等): -ldl を付けておくのが安全");
 #endif
-    note("★Step 7 (Makefile.linux) は本 PR の範囲外★");
-    note("  手動ビルド時は -ldl を付ける事:");
+    note("Step 7 の Makefile.linux は -ldl を渡す (LDLIBS)");
+    note("  手動ビルド時も -ldl を付ける事:");
     note("  gcc ... -lslirp -lpthread -ldl -o vmodem");
 }
 
@@ -1022,29 +1022,62 @@ static void test_6c_no_busy_loop(void)
 }
 
 /* ==========================================================================
- * Step 7 以降に手を付けていない事の確認
+ * Step 7 / 8 の成果物の確認
  * ==========================================================================
- * 指示書は Step 6 までを本 PR の範囲としている。
- * Step 7 (Makefile.linux) / Step 8 (USB gadget) / Step 8-a (INF) の
- * 成果物が存在しない事をテストとして明示しておく。
+ * ★このテストは Step 7/8 の実装に伴って意味を反転させた★
+ *
+ * 元は「Step 7 以降の成果物が *存在しない* 事」を確認していた。
+ * 当時は Step 6 までが PR の範囲で、範囲外に手を付けていない事の
+ * 証明として機能していた。
+ *
+ * Step 7 (Makefile.linux) / Step 8 (USB gadget) / Step 8-a (INF) を
+ * 実装した今、その assert は必ず失敗する。存在しない事を要求する
+ * テストを残したままにはできないので、
+ * 「存在する事」を確認する形に置き換えた。
+ *
+ * 中身の検証は tests/test_linux_step78.c が受け持つ。
+ * ここでは Step 6 のテストから見た依存関係の確認に留める。
  * ========================================================================== */
-static void test_scope_step7_untouched(void)
+static void test_scope_step78_present(void)
 {
-    static const char *forbidden[] = {
-        "Makefile.linux",
-        "scripts/setup-gadget-linux.sh",
-        "windows/vim1modem.inf"
+    static const char *expected[] = {
+        "Makefile.linux",                  /* Step 7   */
+        "scripts/setup-gadget-linux.sh",   /* Step 8   */
+        "windows/vim1modem.inf"            /* Step 8-a */
     };
     size_t i;
 
-    head("範囲確認: Step 7 以降の成果物が存在しない事");
+    head("範囲確認: Step 7 / 8 の成果物が存在する事");
 
-    for (i = 0; i < sizeof(forbidden) / sizeof(forbidden[0]); i++) {
-        int exists = (access(forbidden[i], F_OK) == 0);
-        check(!exists, "%s は未作成 (Step %s は未着手)",
-              forbidden[i], (i == 0) ? "7" : "8");
+    for (i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
+        int exists = (access(expected[i], F_OK) == 0);
+        check(exists, "%s が存在する (Step %s)",
+              expected[i], (i == 0) ? "7" : ((i == 1) ? "8" : "8-a"));
     }
     note("(リポジトリのルートで実行した場合のみ意味を持つ)");
+    note("内容の検証は tests/test_linux_step78.c を参照");
+
+    /*
+     * Step 6 の成果物 (dlsym による libslirp ABI 解決) が
+     * Step 7 のビルドで実際にリンクされる形になっているか。
+     * Makefile に -ldl が無いと古い glibc でリンクできない。
+     */
+    {
+        FILE *fp = fopen("Makefile.linux", "rb");
+        if (!fp) {
+            skip("Makefile.linux を読めないので -ldl の確認を省略");
+        } else {
+            char   buf[65536];
+            size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+            buf[n] = '\0';
+            fclose(fp);
+            check(strstr(buf, "-ldl") != NULL,
+                  "Makefile.linux が -ldl を渡す "
+                  "-> Step 6 の dlsym が古い glibc でもリンクできる");
+            check(strstr(buf, "-lslirp") != NULL,
+                  "Makefile.linux が -lslirp を渡す");
+        }
+    }
 }
 
 /* ==========================================================================
@@ -1079,7 +1112,7 @@ int main(void)
     test_6c_no_busy_loop();
 
     /* 範囲 */
-    test_scope_step7_untouched();
+    test_scope_step78_present();
 
     printf("\n=========================================================\n");
     printf(" 結果: 成功 %d / 失敗 %d / 省略 %d\n", g_pass, g_fail, g_skip);
