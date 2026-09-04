@@ -171,13 +171,79 @@ protocol = V34PLUS          ; V21 V22 V22BIS V32 V32BIS V34 V34PLUS V90
 
 ### DNS について
 
-`mode = slirp` の時、`dns1` / `dns2` は **libslirp の内蔵 DNS プロキシの
-アドレスで自動的に上書き**されます (既定 `192.168.99.3`)。
+`mode = slirp` の時、ゲスト (Windows) に IPCP で配る DNS アドレスは
+**ホストの resolver 設定を見て起動時に自動で選ばれます**。
 
-これは libslirp の仕様上必須です。libslirp は宛先が `vnameserver` と
-**完全に一致する時だけ** DNS を代理してくれます
-(`src/socket.c` の `sotranslate_out4`)。`8.8.8.8` をそのままゲストに教えると、
-libslirp はそれを「ただの外部宛 UDP」として扱い、NAT の外に出そうとして失敗します。
+| ホストの 1 番目の nameserver | ゲストに配る DNS | 理由 |
+|---|---|---|
+| 実アドレス (例 `192.168.1.1`, `8.8.8.8`) | libslirp の内蔵 DNS プロキシ (既定 `192.168.99.3`) | 代理が正しく機能する。VPN や社内 DNS もそのまま使える |
+| ループバック (`127.0.0.53` など) | `dns1` / `dns2` の設定値 (既定 `8.8.8.8` / `8.8.4.4`) | 代理が機能しないため迂回する |
+
+**なぜ条件分岐が必要なのか**
+
+libslirp は宛先が `vnameserver` と **完全に一致する時だけ** DNS を代理します
+(`src/socket.c` の `sotranslate_out4`)。代理が働くと宛先は
+`get_dns_addr()` — Linux では `/etc/resolv.conf` の **1 番目**の nameserver —
+に書き換えられます (`src/slirp.c` の `get_dns_addr_resolv_conf`)。
+
+ここで問題になるのが `SlirpConfig.outbound_addr` です。上記
+「PPP は繋がるのにインターネットに出られない」の対策として、本プログラムは
+全ての外向きソケットをホストの実 NIC アドレスに `bind()` させています。
+その結果、ホストが systemd-resolved を使っている環境では
+
+```
+src = 実 NIC のアドレス  →  dst = 127.0.0.53:53
+```
+
+という組み合わせになりますが、systemd-resolved の stub listener は
+**ローカルループバック インタフェース宛の問い合わせにしか応答しません**。
+よって DNS 応答が返らず、`ERR_NAME_NOT_RESOLVED` になります。
+
+`/etc/resolv.conf` に nameserver が 1 つも無い場合、libslirp は
+`127.0.0.1` にフォールバックするため、これも「ループバック」として扱います。
+
+**起動時ログ**
+
+どちらを選んだかは起動時ログで確認できます。
+
+```
+ppp: DNS に実アドレス 8.8.8.8 / 8.8.4.4 を配る (ホストの resolver がループバックのため slirp の DNS 代理は使わない)
+ppp: DNS に slirp の代理 192.168.99.3 を配る (ホストの resolver が実アドレスなので代理が働く)
+```
+
+> **補足 (Linux ホストの場合)**
+> ホスト側で恒久的に解決したい場合は、`/etc/resolv.conf` の 1 番目の
+> nameserver を実アドレスにする (systemd-resolved の stub を使わない) 方法も
+> あります。その場合は libslirp の DNS 代理がそのまま機能します。
+
+### ping (ICMP) について
+
+ゲストからの `ping 8.8.8.8` は libslirp が **ホスト側のソケットで代理送信**
+します (`src/ip_icmp.c` の `icmp_send`)。使われるソケットは 2 段構えです。
+
+1. `socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)`
+   → プロセスの GID が `net.ipv4.ping_group_range` の範囲内である必要がある
+2. 1 が `EACCES` / `EAFNOSUPPORT` / `EPROTONOSUPPORT` で失敗した場合
+   `socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)`
+   → `CAP_NET_RAW` (実質 root) が必要
+
+両方失敗すると libslirp は `-1` を返し、ゲストの ICMP は**無言で捨てられます**。
+「DNS は引けるのに ping だけ通らない」という症状になります。
+
+Linux ホストでは `net.ipv4.ping_group_range` の Debian 既定値が `1 0` で、
+これは「1 から 0 まで」ではなく **lo > hi つまり空集合**です。さらにこの値は
+揮発性なので**再起動で元に戻ります**。本バージョンでは
+
+- `scripts/99-vmodem.conf` (`/etc/sysctl.d/99-vmodem.conf` にインストール)
+- `scripts/setup-gadget-linux.sh setup` での即時適用
+- `scripts/vmodem.service` の `AmbientCapabilities=CAP_NET_RAW` と
+  `ExecStartPre` による保険
+
+の 3 重で恒久化しています。状態は次で確認できます。
+
+```sh
+sudo ./scripts/setup-gadget-linux.sh status
+```
 
 ---
 

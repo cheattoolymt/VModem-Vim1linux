@@ -44,6 +44,7 @@ Windows 版は com0com の仮想 COM ペアを「電話線」に使っていま�
 | 6 | `src/net/vm_nat_slirp.c` (libslirp の POSIX 対応) | ✅ 完了 |
 | 7 | `Makefile.linux` | ✅ 完了 |
 | 8 | `scripts/setup-gadget-linux.sh` / `windows/vim1modem.inf` | ✅ 完了 |
+| 9 | DNS 解決の環境依存と ICMP 権限の恒久化 (`src/net/vm_netdiag.c` 新規) | ✅ 完了 |
 
 Step 3・4 が入ったので、**libslirp を使わない構成 (`--net none` /
 `--net loopback`) なら Linux 上で実際に起動・常駐・正常終了できます**。
@@ -949,9 +950,29 @@ Linux では前提が違うので、同じコードで害が無いかを実測�
    切り分けは `strace -e trace=bind` か起動ログの bind 先の確認。
 3. NIC の IP に bind した UDP ソケットから `127.0.0.1` へ送っても
    応答が返る。
-   → libslirp の DNS 中継 (`sotranslate_out4` が `vnameserver` 宛を
-   host の resolver へ差し替える) が `127.0.0.53` (systemd-resolved) でも
-   壊れません。**Linux 移植で最も壊れそうだった箇所**ですが問題無しです。
+
+> **【訂正】上記 3 の結論は誤りでした**
+>
+> 「NIC の IP に bind したソケットから `127.0.0.1` へ送っても応答が返る」
+> という実測自体は正しいのですが、そこから
+> 「よって systemd-resolved 相手でも DNS 中継は壊れない」と結論したのが
+> 誤りです。この実測は**自作の素朴な UDP echo サーバ**に対して行ったもので、
+> **systemd-resolved の stub listener を相手にしていませんでした**。
+>
+> systemd-resolved の stub listener (`127.0.0.53` / `127.0.0.54`) は
+> **ローカルループバック インタフェース宛の問い合わせにしか応答しません**。
+> `outbound_addr` によって送信元が実 NIC のアドレスに固定されると、
+>
+> ```
+> src = 実 NIC のアドレス  →  dst = 127.0.0.53:53
+> ```
+>
+> となり、stub listener は応答を返しません。結果として PPP は確立し、
+> IP も配られ、NLA の HTTP チェックも通って「IPv4 接続: インターネット」と
+> 表示されるのに、ブラウザは `ERR_NAME_NOT_RESOLVED` になります。
+>
+> **これが「Linux 移植で最も壊れそうだった箇所」の、実際に壊れていた形**です。
+> 対策は「DNS 解決の環境依存」節を参照してください。
 
 Linux で「繋がらない」時に見る順番:
 
@@ -1036,7 +1057,7 @@ Step 6 の成果物は「`#ifdef` の掛け方」がほとんどで実行時に�
 | 6-c-2 | 子プロセスから 50ms 後に `SIGUSR1` を送り、**`SA_RESTART` 無しの `poll` が実際に `EINTR` で戻る**事 / タイムアウト前に戻る事 |
 | 6-c-3 | `poll` 失敗時の `revents` が信用できない事 = `EINTR` 時にゼロクリアが必要な事 |
 | 6-c-4 | 外向き IP に `bind` できる事 / **存在しない IP への `bind` が `EADDRNOTAVAIL(99)`** になる事 |
-| 6-c-5 | NIC bind 済みソケットから `127.0.0.1` へ**実際に届く**事 = libslirp の DNS 中継が壊れない事 |
+| 6-c-5 | NIC bind 済みソケットから `127.0.0.1` へ**実際に届く**事 (**注**: これを「libslirp の DNS 中継が壊れない事」の根拠としたのは誤りでした。相手が自作 echo サーバだったためです。systemd-resolved の stub listener はループバック IF 宛以外に応答しません → 後述の「DNS 解決の環境依存」節) |
 | 6-c-6 | `vm_nat_create(SLIRP)` が成功する事 (= `slirp_new` が `cfg.version` を受け付けた = ABI 整合) / 20ms × 10 回 `poll` を回せる事 / **`timers_active == 0`** である事 |
 | 6-c-7 | 20 回の `poll` に 1 回あたり 0.5ms 以上掛かる事 = **timeout の下限クランプが効いていて busy loop になっていない**事 |
 | 範囲 | `Makefile.linux` / `scripts/setup-gadget-linux.sh` / `windows/vim1modem.inf` が**存在する**事 + `Makefile.linux` が `-ldl` / `-lslirp` を渡す事 (Step 7/8 実装に伴い、元の「存在しない事」から意味を反転させた) |
@@ -1363,6 +1384,244 @@ AT コマンド (`ATH` / `+++`) とタイムアウトで代替する設計なの
 
 ---
 
+## Step 9: DNS 解決の環境依存と ICMP 権限の恒久化
+
+### 症状
+
+PPP は確立し、IP も配られ、NLA の HTTP チェックも通って Windows の
+ネットワーク アイコンは「**IPv4 接続: インターネット**」と表示されるのに、
+
+* ブラウザは `ERR_NAME_NOT_RESOLVED`
+* `ping 8.8.8.8` はタイムアウト
+
+VIM1 自身の通信は正常 (`curl https://google.com` → 200)。
+
+### 9-a: DNS が引けない理由
+
+**憶測ではなく libslirp の master ソースを直接読んで確定させました。**
+
+#### (1) DNS 代理が発動する条件
+
+```c
+/* libslirp  src/socket.c  sotranslate_out4() */
+if (addr == slirp->vnameserver_addr.s_addr) {
+    if (get_dns_addr(&addr) < 0) { ... }
+    ...
+}
+```
+
+宛先が `vnameserver_addr` と **完全一致し、かつポートが 53 の時だけ**
+代理が働きます。逆に言えば、ゲストに `8.8.8.8` をそのまま教えた場合
+libslirp はそれを「ただの外部宛 UDP」として扱います
+(NAT 経由で本当に 8.8.8.8 へ出て行くので、経路があれば動きます)。
+
+#### (2) 代理後の宛先は `/etc/resolv.conf` の **1 番目**
+
+```c
+/* libslirp  src/slirp.c  get_dns_addr_resolv_conf() */
+if (!strncmp(buff, "nameserver", 10)) {
+    ...                       /* 最初に見つかった 1 件で return */
+}
+/* nameserver が 1 件も無ければ 127.0.0.1 / ::1 にフォールバック */
+```
+
+systemd-resolved を使う環境では `/etc/resolv.conf` の 1 番目は
+`127.0.0.53` (stub listener) です。
+
+#### (3) `outbound_addr` と stub listener の衝突 ← **これが根本原因**
+
+Step 5/6 で入れた `SlirpConfig.outbound_addr` は、libslirp の
+**全ての外向きソケットをホストの実 NIC アドレスに `bind()`** させます。
+その結果、DNS 代理の送信は
+
+```
+src = 実 NIC のアドレス  →  dst = 127.0.0.53:53
+```
+
+という組み合わせになります。ところが **systemd-resolved の stub listener は
+ローカルループバック インタフェース宛の問い合わせにしか応答しません**
+(送信元が非ローカル アドレスの問い合わせは無視される)。
+よって応答が返らず `ERR_NAME_NOT_RESOLVED` になります。
+
+> 前掲の Step 6-c-5 で「NIC bind 済みソケットから `127.0.0.1` へ届いたので
+> DNS 中継は壊れない」と書きましたが、これは**自作の素朴な echo サーバ**を
+> 相手にした実測でした。echo サーバは送信元を問わず返すので通り、
+> stub listener は返さないので通らない — 実測の対象が違っていました。
+> 該当箇所には訂正を追記しています。
+
+#### 診断を誤らせる 2 つの罠
+
+指示書は「`nslookup google.com 192.168.99.3` が無応答」を根拠に
+「libslirp の DNS プロキシが壊れている」としていましたが、これは
+**そもそも成立しない診断**です。
+
+| 罠 | 実態 |
+|---|---|
+| ホストから `nslookup ... 192.168.99.3` が無応答 | `192.168.99.3` は libslirp が**仮想 NIC に入ってきた Ethernet フレームの中の IP** として解釈するアドレスであり、ホストの UDP ソケットからは到達しない。**無応答が正常**。プロキシの健全性の証拠にならない |
+| `sendto()` が成功する | UDP の `sendto` はローカル キューへの投入が成功しただけ。宛先が応答しないことは検出できない |
+
+#### 対策: 環境に応じて配る DNS を選ぶ (`vm_nat_pick_guest_dns`)
+
+指示書の「Option A: 常に `8.8.8.8` を配る」を**そのまま採らなかった**理由は、
+代理が正しく機能する環境 (VPN / 社内 DNS / `dnsmasq` を実アドレスで
+使っている等) で**名前解決できるはずのホスト名が引けなくなる**ためです。
+
+そこで起動時にホストの resolver を実測し、環境ごとに選びます。
+
+```c
+/* include/vmodem/vm_nat.h */
+bool vm_nat_pick_guest_dns(const vm_nat_t *n,
+                           uint32_t fallback1, uint32_t fallback2,
+                           uint32_t *out1, uint32_t *out2);
+```
+
+| ホストの 1 番目の nameserver | ゲストに配る DNS | 戻り値 |
+|---|---|---|
+| 実アドレス (`192.168.1.1` 等) | libslirp の代理 (`192.168.99.3`) | `true` |
+| ループバック (`127.0.0.53` 等) | 設定値 `dns1`/`dns2` (既定 `8.8.8.8`/`8.8.4.4`) | `false` |
+| nameserver が 0 件 | 同上 (libslirp が `127.0.0.1` にフォールバックするため) | `false` |
+| `mode != slirp` | 設定値そのまま | `false` |
+
+`src/modem/vm_modem.c` の `build_ppp_cfg()` から呼び、
+**どちらを選んだかを必ずログに出します**。
+
+```
+ppp: DNS に実アドレス 8.8.8.8 / 8.8.4.4 を配る (ホストの resolver がループバックのため slirp の DNS 代理は使わない)
+ppp: DNS に slirp の代理 192.168.99.3 を配る (ホストの resolver が実アドレスなので代理が働く)
+```
+
+なお設定値が空 (`0`) の場合、`0` を配ると IPCP で Config-Reject を招き
+33.6 kbps では往復が高くつくため、`8.8.8.8` / `8.8.4.4` を補完します。
+
+### 9-b: ping が通らない理由
+
+```c
+/* libslirp  src/ip_icmp.c  icmp_send() */
+so->s = slirp_socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+if (so->s == -1 && (errno == EAFNOSUPPORT
+                 || errno == EPROTONOSUPPORT
+                 || errno == EACCES)) {
+    /* Linux 特有: ping ソケットが使えなければ raw に落ちる */
+    so->s = slirp_socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+}
+if (so->s == -1) { ... return -1; }        /* ← 無言で捨てられる */
+```
+
+2 段構えで、**両方失敗するとゲストの ICMP は無言で捨てられます**。
+
+| 段 | ソケット | 必要な権限 |
+|---|---|---|
+| 1 | `SOCK_DGRAM` + `IPPROTO_ICMP` | プロセスの GID が `net.ipv4.ping_group_range` の範囲内 |
+| 2 | `SOCK_RAW` + `IPPROTO_ICMP` | `CAP_NET_RAW` |
+
+#### `1 0` は「1 から 0」ではなく空集合
+
+Debian / Ubuntu の既定値は
+
+```
+$ cat /proc/sys/net/ipv4/ping_group_range
+1	0
+```
+
+これは `lo=1 > hi=0` すなわち**どの GID も許可しない**という意味です。
+`lo <= gid` だけを見る素朴な判定は GID 1000 を誤って「許可」と判断します。
+本実装は `(lo <= hi) && (gid >= lo) && (gid <= hi)` で判定します。
+
+#### 恒久化 (揮発性 sysctl なので再起動で戻る)
+
+`/proc/sys/...` への直接書き込みは再起動で失われます。
+`/etc/sysctl.d/*.conf` は `systemd-sysctl.service` が起動時に読むので、
+ここに置くのが正攻法です。3 重で確保しています。
+
+| 手段 | ファイル |
+|---|---|
+| sysctl の恒久設定 | `scripts/99-vmodem.conf` → `/etc/sysctl.d/99-vmodem.conf` |
+| セットアップ時の即時適用 | `scripts/setup-gadget-linux.sh` の `setup_ping_sysctl()` |
+| サービス側の保険 | `scripts/vmodem.service` の `AmbientCapabilities=CAP_NET_RAW` + `ExecStartPre` |
+
+```ini
+# /etc/sysctl.d/99-vmodem.conf
+net.ipv4.ping_group_range = 0 2147483647
+```
+
+```ini
+# scripts/vmodem.service
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+ExecStartPre=-/usr/bin/env sh -c 'echo "0 2147483647" > /proc/sys/net/ipv4/ping_group_range'
+```
+
+`ExecStartPre` の先頭の `-` は「失敗しても起動を続ける」という意味です
+(読み取り専用 `/proc` やコンテナ内でサービス自体が起動不能になるのを避ける)。
+
+### 9-c: 新規モジュール `src/net/vm_netdiag.c`
+
+原因が**環境依存で、かつログに何も出ない**種類の障害だったため、
+起動時に自己診断して原因を名指しするモジュールを追加しました。
+
+```c
+/* include/vmodem/vm_netdiag.h */
+bool vm_netdiag_host_resolver(vm_netdiag_resolver_t *out);
+bool vm_netdiag_icmp_probe(vm_netdiag_icmp_t *out);
+void vm_netdiag_report(uint32_t nat_network, uint32_t nat_netmask);
+```
+
+* `vm_netdiag_host_resolver()` — `/etc/resolv.conf` を
+  **libslirp と同じ規則で**解析する (1 番目だけ / `%ifname` を落とす /
+  IPv6 を飛ばす / `#` `;` をコメント扱い / 0 件なら `127.0.0.1`)
+* `vm_netdiag_icmp_probe()` — libslirp の `icmp_send()` と
+  **同じ順序・同じ型**でソケットを試し、`ping_group_range` も読む
+* `vm_netdiag_report()` — 上記を `slirp_be_open()` の最後で出力。
+  ホストの resolver が NAT ネットワーク内 (自己参照) の場合も警告する
+
+IPv4 の解析に `inet_addr` / `inet_pton` を使わず 4 オクテットを
+自前で厳格に解析しているのは、`inet_addr("1.2.3")` が**成功してしまう**ため
+(`1.2.0.3` と解釈される) で、これを許すと判定を誤ります。
+
+テスト容易性のため環境変数で差し替えられます
+(`VM_RESOLV_CONF` / `VM_PING_GROUP_RANGE`)。
+
+### 9-d: 運用時の切り分け
+
+```sh
+sudo ./scripts/setup-gadget-linux.sh status
+```
+
+`show_net_status()` が次を報告します。
+
+* ホストの 1 番目の nameserver は何か
+* libslirp の DNS 代理を使う構成になるか
+* ping ソケットが使える状態か (`ping_group_range` の実値)
+
+Windows 側からの最終確認:
+
+```
+nslookup google.com     … 名前が引ける
+ping 8.8.8.8            … 応答が返る
+```
+
+### 9-e: Step 9 の新規テスト
+
+`tests/test_dnsfix.c` (**26 項目成功 / 失敗 0 / 省略 1**)。
+省略 1 件は sandbox で ICMP ソケットが作れないためで、権限のある実機では実行されます。
+
+```bash
+make -f Makefile.linux build/test_dnsfix && ./build/test_dnsfix
+```
+
+| 節 | 検証する事 |
+|---|---|
+| 1 | `resolv.conf` 解析 12 ケース (`127.0.0.53` / 実アドレス / 複数行は 1 番目 / `%eth0` 付き / IPv6 は飛ばす / 0 件は `127.0.0.1` 扱い / コメント / `nameserverfoo` は不一致 / `1.2.3` と `300.1.1.1` は不正 / タブ区切り / ファイル欠損) |
+| 2 | `vm_nat_pick_guest_dns()` の両分岐 (代理を使う / 使わない) と NULL 安全性、設定値が空でも `0` を配らない事 |
+| 3 | ICMP プローブの整合性 (`ok == (dgram_ok \|\| raw_ok)`) |
+| 4 | `ping_group_range` の判定 (`"1 0"` は空集合 / `"0 2147483647"` は許可 / 読めない場合) |
+| 5 | `vm_netdiag_report()` のスモーク テスト (自己参照ケースを含む) |
+
+環境依存の値は assert せず、「どの環境でも成り立つ性質」だけを判定する方針は
+Step 6 と同じです。
+
+---
+
 
 ## ビルドに必要なもの
 
@@ -1426,6 +1685,8 @@ src/net/                 PPP / HDLC / 疑似 Ethernet / NAT
   vm_hostroute.c         外向きアドレス検出 Windows 版
                          ★Step 5 で翻訳単位ごと _WIN32 で囲み Linux から除外
   vm_hostroute_linux.c   ★Linux / getifaddrs 版 (Step 5-a)
+  vm_netdiag.c           ★DNS / ICMP の自己診断 (Step 9。libslirp と同じ規則で
+                           resolv.conf を解析し ping_group_range も実測する)
 src/serial/
   vm_serial.c            共通処理・バックエンド振り分け
   vm_serial_win32.c      Windows (上流)
@@ -1434,7 +1695,9 @@ src/main.c               ★エントリポイント (Step 3 でシグナル処�
 scripts/
   setup-gadget-linux.sh  ★configfs で CDC-ACM ガジェットを構成 (Step 8・冪等)
   99-vmodem.rules        ★udev ルール (Step 8。RUN+= ではなく SYSTEMD_WANTS)
-  vmodem.service         ★systemd unit (Step 8。BindsTo=dev-ttyGS0.device)
+  vmodem.service         ★systemd unit (Step 8。BindsTo=dev-ttyGS0.device。
+                           Step 9 で CAP_NET_RAW と ping_group_range を追加)
+  99-vmodem.conf         ★sysctl 恒久設定 (Step 9。ping_group_range)
 windows/
   vim1modem.inf          ★Windows XP 用 INF (Step 8-a。ASCII + CRLF 必須)
 tests/
@@ -1445,6 +1708,8 @@ tests/
   test_linux_step78.c    ★Step 7・8・8-a の検証
                            (ガジェットスクリプトを VM_TEST_ROOT で実行して
                             冪等性・teardown 順序まで実測する)
+  test_dnsfix.c          ★Step 9 の検証 (resolv.conf 解析 12 ケース /
+                            配る DNS の両分岐 / ping_group_range の空集合)
 docs/README-windows.md   上流 Windows 版の README (libslirp の罠など)
 ```
 

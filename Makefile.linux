@@ -220,6 +220,7 @@ SRCS = src/main.c \
        src/net/vm_nat.c \
        src/net/vm_nat_loopback.c \
        src/net/vm_nat_slirp.c \
+       src/net/vm_netdiag.c \
        src/net/vm_hostroute_linux.c \
        src/net/vm_ppp.c \
        src/serial/vm_serial.c \
@@ -277,6 +278,7 @@ AUDIO_SRCS = src/audio/vm_audio.c src/audio/vm_audio_null.c \
 MODEM_SRCS = src/modem/vm_at.c src/modem/vm_modem.c src/modem/vm_sequence.c
 NET_SRCS   = src/net/vm_eth.c src/net/vm_hdlc.c src/net/vm_nat.c \
              src/net/vm_nat_loopback.c src/net/vm_nat_slirp.c \
+             src/net/vm_netdiag.c \
              src/net/vm_hostroute_linux.c src/net/vm_ppp.c
 SER_SRCS   = src/serial/vm_serial.c src/serial/vm_serial_linux.c
 
@@ -296,10 +298,14 @@ DEPS_test_linux_step34 = $(CORE_SRCS)
 DEPS_test_linux_step5 = $(CORE_SRCS) $(NET_SRCS) src/net/vm_hostroute.c
 DEPS_test_linux_step6 = $(CORE_SRCS) $(NET_SRCS)
 DEPS_test_linux_step78 = $(CORE_SRCS)
+# test_dnsfix: DNS 代理の可否判定と ICMP 診断。
+#   vm_netdiag.c は NET_SRCS に含まれている。
+DEPS_test_dnsfix      = $(CORE_SRCS) $(NET_SRCS)
 
 TESTS = test_core test_dsp test_resample test_at test_sequence test_audio \
         test_ppp test_nat test_linux_port test_linux_step34 \
-        test_linux_step5 test_linux_step6 test_linux_step78
+        test_linux_step5 test_linux_step6 test_linux_step78 \
+        test_dnsfix
 
 TEST_BINS = $(addprefix $(BUILD)/,$(TESTS))
 
@@ -473,18 +479,30 @@ install: $(TARGET)
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/$(TARGET)
 	rm -f $(DESTDIR)$(PREFIX)/bin/vmodem-setup-gadget
+	rm -f $(DESTDIR)/etc/sysctl.d/99-vmodem.conf
 	@echo "/etc/vmodem は残しました (設定ファイルの保護)"
 
 # udev ルールと systemd unit の配置。
 # 詳細は scripts/99-vmodem.rules 冒頭を参照。
+#
+# ★ sysctl 設定も一緒に入れる ★
+#   net.ipv4.ping_group_range が既定 ("1 0" = 空集合) のままだと
+#   libslirp が ping ソケットを開けず、ゲストからの ping が
+#   ログも出さずに捨てられる。詳細は scripts/99-vmodem.conf 冒頭。
 gadget-install:
+	install -d $(DESTDIR)/etc/udev/rules.d
 	install -m 0644 scripts/99-vmodem.rules \
 	        $(DESTDIR)/etc/udev/rules.d/99-vmodem.rules
+	install -d $(DESTDIR)/etc/systemd/system
 	install -m 0644 scripts/vmodem.service \
 	        $(DESTDIR)/etc/systemd/system/vmodem.service
+	install -d $(DESTDIR)/etc/sysctl.d
+	install -m 0644 scripts/99-vmodem.conf \
+	        $(DESTDIR)/etc/sysctl.d/99-vmodem.conf
 	@echo "配置しました。有効化するには:"
 	@echo "  sudo udevadm control --reload-rules"
 	@echo "  sudo systemctl daemon-reload"
+	@echo "  sudo sysctl --system      # ping_group_range を今すぐ反映"
 
 # ---------------------------------------------------------------------------
 clean:

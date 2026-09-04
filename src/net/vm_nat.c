@@ -19,6 +19,7 @@
 #include <stdio.h>
 
 #include "vm_nat_internal.h"
+#include "vmodem/vm_netdiag.h"
 
 #ifdef _WIN32
 #  include <windows.h>
@@ -597,8 +598,108 @@ uint32_t vm_nat_dns_ip(const vm_nat_t *n)
      *
      * ゲストに vnameserver を教えれば、名前解決は必ずホストと同じ
      * 経路・同じ結果になる。これが slirp を使う時の正しい作法。
+     *
+     * ==========================================================================
+     * ★★★ 上の理屈には前提があり、Linux ではそれが崩れる ★★★
+     * ==========================================================================
+     * 「必ずホストと同じ経路・同じ結果になる」は
+     * **get_dns_addr() が到達可能なアドレスを返す時にのみ** 成立する。
+     *
+     * Linux 版の get_dns_addr() は /etc/resolv.conf の最初の nameserver を
+     * 返す (src/slirp.c get_dns_addr_resolv_conf)。Armbian / Debian /
+     * Ubuntu で systemd-resolved が動いていると、これは 127.0.0.53
+     * (stub listener) になる。
+     *
+     * ここで本実装が outbound_addr を設定している事が裏目に出る。
+     * libslirp は全ての外向きソケットを実 NIC の IP に bind するので、
+     * DNS 代理のソケットも実 NIC の IP に固定され、
+     *
+     *     送信元 192.168.x.y:随意  ->  宛先 127.0.0.53:53
+     *
+     * という UDP を送る事になる。systemd-resolved の stub listener は
+     * ループバック上のローカル発信を前提としており、この様な非ローカル
+     * 送信元のクエリには応答しない。
+     * つまり **代理は成立せず、ゲストの DNS は永久に無応答** になる。
+     *
+     * ★ 切り分けを誤らせる 2 つの落とし穴 ★
+     *   (1) sendto(2) は成功する。エラーにならないので strace でも
+     *       「送れている」ように見える。返事が来ないだけ。
+     *   (2) VIM1 自身から `nslookup google.com 192.168.99.3` を叩いても
+     *       タイムアウトするが、これは **故障の証拠にならない**。
+     *       192.168.99.3 は libslirp のプロセス内部にしか存在せず、
+     *       代理はゲスト由来の Ethernet フレームが slirp_input() を
+     *       通った時にだけ働く。ホストの IP スタックから叩ける物ではない。
+     *
+     * よって「代理を配るか、実 DNS を配るか」は環境を測ってから決める。
+     * その判断は vm_nat_pick_guest_dns() に置いた。
+     * このアクセサは代理アドレスそのものを返す責務だけを持つ。
      */
     return (n != NULL) ? n->cfg.dns_ip : 0u;
+}
+
+bool vm_nat_pick_guest_dns(const vm_nat_t *n,
+                           uint32_t fallback1, uint32_t fallback2,
+                           uint32_t *out1, uint32_t *out2)
+{
+    vm_netdiag_resolver_t rs;
+
+    if (out1 == NULL || out2 == NULL)
+        return false;
+
+    /* 既定は fallback (= config.ini の dns1 / dns2) */
+    *out1 = fallback1;
+    *out2 = fallback2;
+
+    /*
+     * 代理が存在するのは slirp バックエンドだけ。
+     * loopback / none では config の値をそのまま配る
+     * (どうせ外に出られないが、設定が黙って無視されるより分かりやすい)。
+     */
+    if (n == NULL || n->backend != VM_NAT_SLIRP || n->cfg.dns_ip == 0u)
+        return false;
+
+    /*
+     * ホストのリゾルバを測る。
+     *
+     * ★ ループバックなら代理は使えない ★
+     *   理由は vm_nat_dns_ip() の長いコメントに書いた通り。
+     *   代理を諦めて実在の外部 DNS を配る。libslirp はそれを
+     *   「ただの外部 UDP」として NAT するので、ゲストのクエリは
+     *   8.8.8.8:53 に直接届き、応答も普通に返る。
+     *
+     * ★ 実アドレスなら代理を使う ★
+     *   この場合 get_dns_addr() は到達可能なアドレスを返すので、
+     *   従来通り代理が正しく機能する。VPN や社内 DNS にも追従できる
+     *   という利点があるので、使えるなら使う方が良い。
+     */
+    if (vm_netdiag_host_resolver(&rs) && rs.loopback) {
+        /*
+         * fallback が両方 0 だと vm_ppp は DNS オプションを
+         * Config-Reject する。RAS / pppd は Reject を受けると
+         * 設定を作り直してもう 1 往復するので、33.6kbps では
+         * 接続完了が目に見えて遅くなる。
+         * 設定が空だった場合の最後の逃げ道として公開 DNS を入れる。
+         */
+        if (*out1 == 0u)
+            *out1 = 0x08080808u;    /* 8.8.8.8 */
+        if (*out2 == 0u)
+            *out2 = 0x08080404u;    /* 8.8.4.4 */
+
+        return false;
+    }
+
+    /*
+     * 代理を使う。
+     * dns2 にも同じ代理アドレスを入れる。一見冗長だが理由がある:
+     *   - 代理は 1 つしか無いので 2 番目に別のアドレスを教えられない。
+     *   - dns2 = 0 にすると DNS2 オプションが Config-Reject され、
+     *     上に書いた通り 1 往復増える。
+     *   - 同じアドレスを 2 つ配っても、同一サーバを 2 回引くだけで
+     *     動作上の不利益は無い。
+     */
+    *out1 = n->cfg.dns_ip;
+    *out2 = n->cfg.dns_ip;
+    return true;
 }
 
 const char *vm_nat_status(const vm_nat_t *n, char *buf, size_t size)

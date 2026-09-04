@@ -160,6 +160,135 @@ write_attr() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+#  ICMP (ping) を通すための sysctl
+# ---------------------------------------------------------------------------
+#  ★ なぜ必要か ★
+#  libslirp の ICMP は 2 段構えでソケットを開く
+#  (libslirp master src/ip_icmp.c icmp_send):
+#
+#      so->s = slirp_socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+#      if (not_valid_socket(so->s)) {
+#          if (errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT
+#           || errno == EACCES) {
+#              so->so_type = IPPROTO_IP;
+#              so->s = slirp_socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+#          }
+#      }
+#      if (not_valid_socket(so->s)) {
+#          return -1;          <- ここに来るとゲストの ping は無応答
+#      }
+#
+#    1 段目 SOCK_DGRAM+IPPROTO_ICMP ("ping ソケット")
+#         net.ipv4.ping_group_range に自分の gid が無いと EACCES。
+#    2 段目 SOCK_RAW+IPPROTO_ICMP
+#         CAP_NET_RAW が無いと EPERM。
+#
+#  両方失敗すると icmp_send() は -1 を返し、ゲストの ICMP Echo は
+#  **ログも出さずに捨てられる**。これが
+#  「Web は見られるのに ping 8.8.8.8 だけ通らない」の正体である。
+#
+#  ★ Debian 系の既定値の罠 ★
+#    /proc/sys/net/ipv4/ping_group_range の既定は `1 0`。
+#    これは「gid 1 以上 0 以下」= **空集合** であって、
+#    「gid 1 から 0 まで」ではない。つまり誰も ping ソケットを開けない。
+#    lo <= gid だけを見て「1000 は 1 以上だから OK」と誤読しやすい。
+#
+#  ★ なぜ sysctl.d に書くのか ★
+#    /proc に echo するだけでは **再起動でリセットされる**。
+#    「昨日は動いたのに今日は ping が通らない」の原因がこれ。
+#    /etc/sysctl.d/*.conf は systemd-sysctl.service が起動時に
+#    読み込むので、恒久化はここに書くのが正しい作法。
+#
+#  ★ root で動かすなら本来は不要 ★
+#    root は CAP_NET_RAW を持つので 2 段目が成功する。
+#    しかし将来 systemd の User= や AmbientCapabilities で
+#    非 root 化した時に静かに壊れるので、両方の道を用意しておく。
+SYSCTL_CONF="${VM_SYSCTL_CONF:-/etc/sysctl.d/99-vmodem.conf}"
+PING_RANGE_PROC="${VM_PING_GROUP_RANGE:-/proc/sys/net/ipv4/ping_group_range}"
+
+# 恒久化ファイルを書く (べき等)。
+setup_ping_sysctl() {
+    local want="0 2147483647"
+    local desired="net.ipv4.ping_group_range = $want"
+
+    # --- 1) 恒久化 ---
+    if [ -n "$VM_TEST_ROOT" ]; then
+        SYSCTL_CONF="$VM_TEST_ROOT/etc/sysctl.d/99-vmodem.conf"
+        PING_RANGE_PROC="$VM_TEST_ROOT/proc-ping-group-range"
+        mkdir -p "$(dirname "$SYSCTL_CONF")"
+    fi
+
+    if [ -f "$SYSCTL_CONF" ] && grep -qF "$desired" "$SYSCTL_CONF" 2>/dev/null
+    then
+        ok "sysctl の恒久設定は既にあります: $SYSCTL_CONF"
+    else
+        if mkdir -p "$(dirname "$SYSCTL_CONF")" 2>/dev/null && \
+           cat > "$SYSCTL_CONF" <<EOS 2>/dev/null
+# VModem が生成 -- 触っても構いませんが、意味を理解してから変更してください。
+#
+# libslirp がゲスト (Windows) の ping を中継するには、
+# SOCK_DGRAM+IPPROTO_ICMP ソケット ("ping ソケット") を開く必要があります。
+# それが許される gid の範囲がこの sysctl です。
+#
+# Debian 系の既定は "1 0" ですが、これは lo > hi なので **空集合** です
+# (「1 から 0 まで」ではありません)。つまり誰も開けません。
+# 全ユーザに許可するには 0 から gid の最大値までを指定します。
+#
+# これは ping (ICMP Echo) を送れるようにするだけで、
+# 任意のパケットを組み立てられる raw socket (CAP_NET_RAW) とは違います。
+# 各種ディストリビューションが既定で広く開けている設定でもあります。
+$desired
+EOS
+        then
+            ok "sysctl の恒久設定を作成しました: $SYSCTL_CONF"
+        else
+            warn "$SYSCTL_CONF を作成できませんでした (権限?)。"
+            warn "ping を通すには手動で次を実行してください:"
+            warn "  echo '$desired' | sudo tee $SYSCTL_CONF"
+        fi
+    fi
+
+    # --- 2) 今すぐ反映 ---
+    #  sysctl.d は起動時にしか読まれないので、再起動を待たずに当てる。
+    #  sysctl(8) が無い最小構成でも動くよう /proc に直接書く道も持つ。
+    local cur=""
+    cur="$(cat "$PING_RANGE_PROC" 2>/dev/null || true)"
+
+    if [ -z "$cur" ]; then
+        # 疑似ルートやコンテナでは存在しない事がある
+        if [ -n "$VM_TEST_ROOT" ]; then
+            printf '%s\n' "$want" > "$PING_RANGE_PROC" 2>/dev/null || true
+            ok "(疑似ルート) ping_group_range を書きました"
+        else
+            warn "$PING_RANGE_PROC が読めません。カーネルが ping ソケットを"
+            warn "サポートしていない可能性があります (CONFIG_IP_PING_GROUP_RANGE)。"
+            warn "vmodem を root で動かせば SOCK_RAW にフォールバックします。"
+        fi
+        return 0
+    fi
+
+    # 既に十分広いか判定する。
+    #   ★ lo > hi は空集合 ★ なので、単純な数値比較では駄目。
+    local lo hi
+    lo="$(printf '%s' "$cur" | awk '{print $1}')"
+    hi="$(printf '%s' "$cur" | awk '{print $2}')"
+
+    if [ -n "$lo" ] && [ -n "$hi" ] && \
+       [ "$lo" -le 0 ] 2>/dev/null && [ "$hi" -ge 65534 ] 2>/dev/null; then
+        ok "ping_group_range は既に有効です (\"$cur\")"
+        return 0
+    fi
+
+    if printf '%s\n' "$want" > "$PING_RANGE_PROC" 2>/dev/null; then
+        ok "ping_group_range を \"$cur\" から \"$want\" に変更しました"
+    else
+        warn "ping_group_range を変更できませんでした (現在 \"$cur\")。"
+        warn "ゲストからの ping が無応答になりますが、TCP/UDP は動くので"
+        warn "Web ブラウジングには影響しません。"
+    fi
+}
+
 # --- 事前確認 --------------------------------------------------------------
 require_root() {
     # 疑似ルートは普通のディレクトリなので root は要らない
@@ -278,6 +407,75 @@ cmd_status() {
         printf '  %-13s : %s無し%s\n' "$TTY_DEV" "$C_WARN" "$C_OFF"
     fi
     printf '\n'
+    show_net_status
+}
+
+# ---------------------------------------------------------------------------
+#  ネットワーク側の状態表示
+# ---------------------------------------------------------------------------
+#  「PPP は繋がるのに名前解決できない / ping が通らない」を
+#  実機で 10 秒で切り分けるための表示。
+#  vmodem 本体も起動時に同じ内容をログに出す (src/net/vm_netdiag.c) が、
+#  vmodem を起動する前に確認したい事があるのでここにも置く。
+show_net_status() {
+    printf '=== ネットワーク環境 ===\n'
+
+    # --- DNS ---
+    local ns=""
+    ns="$(awk '/^[[:space:]]*nameserver[[:space:]]/ {print $2; exit}' \
+          /etc/resolv.conf 2>/dev/null || true)"
+
+    if [ -z "$ns" ]; then
+        printf '  ホストの DNS  : %s(resolv.conf に nameserver 無し)%s\n' \
+            "$C_WARN" "$C_OFF"
+        ns="127.0.0.1"
+    else
+        printf '  ホストの DNS  : %s\n' "$ns"
+    fi
+
+    # ★ ここが名前解決トラブルの分岐点 ★
+    case "$ns" in
+        127.*)
+            printf '  DNS 代理      : %s使わない%s\n' "$C_WARN" "$C_OFF"
+            cat <<'EOS'
+     ホストの DNS がループバック (systemd-resolved の stub listener) を
+     指しています。libslirp の DNS 代理は外向きソケットを実 NIC の
+     アドレスに bind するため、stub listener には届きません
+     (非ローカル送信元のクエリには応答しないため)。
+     → VModem はゲストに config.ini の dns1/dns2 (実在の外部 DNS) を
+        配ります。これが正常動作です。
+EOS
+            ;;
+        *)
+            printf '  DNS 代理      : %s使う%s (ホストと同じ解決結果になります)\n' \
+                "$C_OK" "$C_OFF"
+            ;;
+    esac
+
+    # --- ICMP ---
+    local cur=""
+    cur="$(cat "$PING_RANGE_PROC" 2>/dev/null || true)"
+    if [ -z "$cur" ]; then
+        printf '  ping ソケット : %s不明%s (%s が読めません)\n' \
+            "$C_WARN" "$C_OFF" "$PING_RANGE_PROC"
+    else
+        local lo hi
+        lo="$(printf '%s' "$cur" | awk '{print $1}')"
+        hi="$(printf '%s' "$cur" | awk '{print $2}')"
+        # ★ lo > hi は空集合 ★
+        if [ -n "$lo" ] && [ -n "$hi" ] && \
+           [ "$lo" -le "$hi" ] 2>/dev/null; then
+            printf '  ping ソケット : %s可%s (ping_group_range = "%s")\n' \
+                "$C_OK" "$C_OFF" "$cur"
+        else
+            printf '  ping ソケット : %s不可%s (ping_group_range = "%s" は空集合)\n' \
+                "$C_WARN" "$C_OFF" "$cur"
+            printf '     → sudo bash %s で恒久設定を作成できます\n' "$0"
+            printf '        (root で vmodem を動かす場合は SOCK_RAW に\n'
+            printf '         フォールバックするので実害はありません)\n'
+        fi
+    fi
+    printf '\n'
 }
 
 # --- 取り外し --------------------------------------------------------------
@@ -349,6 +547,11 @@ cmd_setup() {
     require_root
     load_libcomposite
     mount_configfs
+
+    # ★ ガジェットの前に済ませる ★
+    #   ここで失敗しても致命的ではない (ping だけが通らなくなる) ので
+    #   die せず warn に留める。ガジェットの設定は続行する。
+    setup_ping_sysctl
 
     # --- べき等の判定 ---
     if gadget_state; then

@@ -33,6 +33,30 @@ Type=simple
 # ホスト経路の設定 (Step 5) のために root で動かすのが簡単。
 User=root
 
+# ---------------------------------------------------------------------------
+#  ICMP (ゲストからの ping) を通すために必要な権限
+# ---------------------------------------------------------------------------
+#  libslirp は ICMP を 2 段構えで扱う (src/ip_icmp.c icmp_send):
+#    1 段目 SOCK_DGRAM+IPPROTO_ICMP -> net.ipv4.ping_group_range 次第
+#    2 段目 SOCK_RAW+IPPROTO_ICMP   -> CAP_NET_RAW が必要
+#  両方失敗すると icmp_send() は -1 を返し、ゲストの ICMP Echo は
+#  ログも出さずに捨てられる (= ping だけ無応答, TCP/UDP は正常)。
+#
+#  User=root なら CAP_NET_RAW は元から持っているので下記は冗長だが、
+#  明示しておく事に 2 つの意味がある:
+#    (1) 将来 User= を非 root に変えた時に静かに壊れない
+#        (AmbientCapabilities は非 root プロセスにも権限を渡せる)
+#    (2) NoNewPrivileges 等の強化オプションを足した時に
+#        「何が必要か」が unit を見れば分かる
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+
+# ping_group_range は sysctl なので **再起動でリセットされる**。
+# 恒久化は /etc/sysctl.d/99-vmodem.conf が担うが、
+# udev 起動など sysctl.d の適用前に立ち上がる経路もあるため、
+# ここでも念のため当てておく (失敗しても '-' で起動は続行)。
+ExecStartPre=-/usr/bin/env sh -c 'echo "0 2147483647" > /proc/sys/net/ipv4/ping_group_range'
+
 # ExecStartPre: ガジェットがまだ無い状況 (手動 start など) でも
 #   立ち上がるように、べき等なセットアップを一度呼ぶ。
 #   既に bind 済みなら何もせず 0 で返る。
