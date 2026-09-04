@@ -216,41 +216,51 @@ static void build_ppp_cfg(const vm_modem_t *m, const vm_isp_entry_t *isp,
     if (c->ppp_dns2[0] && vm_ipv4_parse(c->ppp_dns2, &ip)) pc->dns2 = ip;
 
     /*
-     * ★ ここが「PPP は繋がるのに名前解決できない」原因のひとつ ★
+     * ★ ここが「PPP は繋がるのに名前解決できない」の本命 ★
      *
-     * slirp バックエンドの DNS 代理は、宛先が vnameserver
-     * (既定 192.168.99.3) と **完全一致**した時だけ働く。
-     * 8.8.8.8 を配ると、DNS クエリは代理されずただの外部 UDP として
-     * NAT され、53/udp を塞ぐ環境や VPN 環境で解決できなくなる。
-     * (詳細な根拠は vm_nat_dns_ip() の実装コメント)
+     * 旧実装は slirp の時に無条件で代理アドレス (192.168.99.3) を配って
+     * いた。しかしそれが正しいのは
+     * 「ホストの resolv.conf が到達可能なアドレスを指している」
+     * 時だけである。
      *
-     * よって slirp を使っている時は config の dns1 を無視し、
-     * NAT が持つ代理アドレスを配る。
+     * systemd-resolved が動く環境 (Armbian / Debian / Ubuntu の既定)
+     * では resolv.conf は 127.0.0.53 を指す。本実装は outbound_addr を
+     * 設定して外向きソケットを実 NIC の IP に bind しているため、
+     * 代理は「実 NIC の IP から 127.0.0.53 へ」クエリを送る事になり、
+     * stub listener はそれに応答しない。結果として代理は完全に無応答で、
+     * ゲストは ERR_NAME_NOT_RESOLVED になる。
      *
-     * dns2 にも同じ代理アドレスを入れる。一見冗長だが理由がある:
+     * よって環境を測ってから決める。判断のロジックと根拠は
+     * vm_nat_pick_guest_dns() / vm_nat_dns_ip() の実装コメントにある。
      *
-     *   - 代理は 1 つしか無いので、2 番目に別のアドレスを教えられない。
-     *   - かといって dns2 = 0 にすると vm_ppp は DNS2 オプションを
-     *     Config-Reject する。RAS は Reject を受けると設定を作り直して
-     *     もう 1 往復するため、接続完了が目に見えて遅くなる
-     *     (33.6kbps では 1 往復が数百 ms に効いてくる)。
-     *   - 同じアドレスを 2 つ配っても Windows は同一サーバを 2 回引くだけで、
-     *     動作上の不利益は無い。
-     *
-     * loopback / none バックエンドでは代理が無いので config の値を使う
-     * (どうせ外に出られないが、設定が効かないより分かりやすい)。
+     * ★ 切り分けの注意 ★
+     *   VIM1 自身から `nslookup google.com 192.168.99.3` を叩いて
+     *   タイムアウトしても、それは故障の証拠にならない。
+     *   192.168.99.3 は libslirp のプロセス内部だけに存在する
+     *   仮想アドレスで、代理はゲスト由来のフレームにしか働かない。
      */
-    if (m->nat != NULL && vm_nat_active_backend(m->nat) == VM_NAT_SLIRP) {
-        uint32_t proxy = vm_nat_dns_ip(m->nat);
-        if (proxy != 0u) {
-            if (proxy != pc->dns1) {
-                char abuf[16];
-                VM_LOGI("ppp: DNS を slirp の代理 %s に差し替える "
-                        "(config の dns1/dns2 は slirp では代理されないため)",
-                        vm_ipv4_str(proxy, abuf, sizeof(abuf)));
+    {
+        uint32_t d1 = pc->dns1;
+        uint32_t d2 = pc->dns2;
+        bool     used_proxy;
+
+        used_proxy = vm_nat_pick_guest_dns(m->nat, d1, d2,
+                                           &pc->dns1, &pc->dns2);
+
+        if (m->nat != NULL && vm_nat_active_backend(m->nat) == VM_NAT_SLIRP) {
+            char a[16], b[16];
+
+            if (used_proxy) {
+                VM_LOGI("ppp: DNS に slirp の代理 %s を配る "
+                        "(ホストの resolver が実アドレスなので代理が働く)",
+                        vm_ipv4_str(pc->dns1, a, sizeof(a)));
+            } else {
+                VM_LOGI("ppp: DNS に実アドレス %s / %s を配る "
+                        "(ホストの resolver がループバックのため "
+                        "slirp の DNS 代理は使わない)",
+                        vm_ipv4_str(pc->dns1, a, sizeof(a)),
+                        vm_ipv4_str(pc->dns2, b, sizeof(b)));
             }
-            pc->dns1 = proxy;
-            pc->dns2 = proxy;
         }
     }
 

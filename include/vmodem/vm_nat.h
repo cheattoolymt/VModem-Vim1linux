@@ -239,13 +239,54 @@ vm_nat_backend_t vm_nat_active_backend(const vm_nat_t *n);
  * NAT が用意した DNS 代理アドレス (ホストオーダ)。
  *
  * slirp バックエンドではこのアドレスの 53/udp 宛だけが
- * ホストの実 DNS サーバへ差し替えられる。したがって PPP の IPCP で
- * ゲストに配る DNS はこの値でなければならない。
- * 詳しい理屈は src/net/vm_nat.c の実装コメントを参照。
+ * ホストの実 DNS サーバへ差し替えられる。
+ *
+ * ★ ただし「代理を配るべきか」は環境依存である ★
+ *   ホストの resolv.conf がループバック (systemd-resolved の
+ *   127.0.0.53 等) を指している場合、代理は無応答になる。
+ *   ゲストに配る値を決めるには vm_nat_pick_guest_dns() を使う事。
+ *   このアクセサは「代理アドレスそのもの」を返すだけである。
  *
  * n == NULL の時は 0 を返す。
  */
 uint32_t vm_nat_dns_ip(const vm_nat_t *n);
+
+/* --------------------------------------------------------------------------
+ * ゲストに配るべき DNS の決定
+ * --------------------------------------------------------------------------
+ * ★ これが「PPP は繋がるのに名前解決できない」の本命の修正 ★
+ *
+ * libslirp の DNS 代理 (vnameserver) は、ゲストのクエリの宛先を
+ * ホストの resolv.conf の最初の nameserver に書き換えて転送する
+ * (src/socket.c sotranslate_out4 -> get_dns_addr)。
+ *
+ * ホストが systemd-resolved を使っていると、その nameserver は
+ * 127.0.0.53 になる。ところが本実装は SlirpConfig.outbound_addr を
+ * 設定しているため、libslirp は全ての外向きソケットを実 NIC の
+ * アドレスに bind する。結果、
+ *
+ *     送信元 192.168.x.y  ->  宛先 127.0.0.53:53
+ *
+ * という UDP になり、stub listener は非ローカル送信元のクエリに
+ * 応答しないので **無応答** になる。ゲストからは
+ * 「DNS サーバが死んでいる」と見える。
+ *
+ * よって:
+ *   ホストの DNS がループバック  → 代理を使わず、設定の実 DNS を配る
+ *                                  (libslirp は通常の UDP として NAT する)
+ *   ホストの DNS が実アドレス    → 代理を配る (VPN や社内 DNS に追従できる)
+ *
+ * fallback1 / fallback2 には config.ini の dns1 / dns2 を渡す。
+ * 代理を使うと判断した場合は *out1 = *out2 = 代理アドレスになる。
+ *
+ * out1 / out2 は NULL 不可。n が NULL または slirp 以外なら
+ * fallback をそのまま返す (loopback / none では代理が無い)。
+ *
+ * 戻り値: true なら代理アドレスを選んだ、false なら fallback を選んだ。
+ */
+bool vm_nat_pick_guest_dns(const vm_nat_t *n,
+                           uint32_t fallback1, uint32_t fallback2,
+                           uint32_t *out1, uint32_t *out2);
 
 /* 単調増加ナノ秒クロック (難所 6)。バックエンド実装からも使う。 */
 int64_t vm_nat_now_ns(void);

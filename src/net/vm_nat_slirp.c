@@ -65,6 +65,7 @@ const vm_nat_backend_ops_t *vm_nat_ops_slirp(void)
  */
 #include "vmodem/vm_winsock.h"
 #include "vmodem/vm_hostroute.h"
+#include "vmodem/vm_netdiag.h"
 
 #include <libslirp.h>
 
@@ -1482,6 +1483,19 @@ static vm_err_t slirp_be_open(vm_nat_t *n)
         VM_LOGI("nat(slirp): 起動 gateway=%s guest=%s mtu=%d restricted=%d",
                 a, b, n->cfg.mtu, (int)n->cfg.restricted);
     }
+
+    /*
+     * ★ ホスト環境の実測をここで 1 度だけ行う ★
+     *
+     * 「PPP は繋がるのに名前解決できない / ping が通らない」は
+     * どちらもホスト側の環境 (resolv.conf, ping_group_range,
+     * CAP_NET_RAW) が原因で、コードからは見えない。
+     * 起動時に測って警告を出しておかないと、運用者は
+     * 「VModem のバグ」と判断して延々ソースを読む事になる。
+     *
+     * 副作用は無い (読むだけ、socket を開いて即閉じるだけ)。
+     */
+    vm_netdiag_report(n->cfg.network, n->cfg.netmask);
 
     return VM_OK;
 }
