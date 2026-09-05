@@ -106,32 +106,101 @@ DriverVer   = 04/01/2009,5.1.2600.0
 %PROVIDER% = DeviceList, NT, NTamd64
 
 ; ---------------------------------------------------------------------------
-;  Hardware IDs
+;  Hardware and compatible IDs
 ;
-;  For an IAD composite device Windows creates a child device per
-;  function, and its hardware ID carries &MI_xx (Multiple Interface).
-;  The CDC-ACM communication interface is number 0, so it appears as
-;  &MI_00. If the device is instead enumerated as a single-function
-;  device (no IAD), no &MI_xx suffix is present. Both forms are listed
-;  so either enumeration path binds. MI_02 is included as well, to cover
-;  a second ACM function if one is ever added to the gadget.
+;  WHY THE PREVIOUS LIST DID NOT MATCH AUTOMATICALLY ON XP
+;  ------------------------------------------------------
+;  The earlier revision of this file listed hardware IDs only:
+;    USB\VID_1209&PID_0001&MI_00
+;    USB\VID_1209&PID_0001
+;    USB\VID_1209&PID_0001&MI_02
+;  and no compatible ID at all. That is the actual defect.
+;
+;  Primary source: "Standard USB Identifiers" (Microsoft, Windows
+;  Drivers / Device Installation). For a composite (multiple-interface)
+;  USB device the generic parent driver generates, per interface
+;  collection, the device ID
+;
+;    USB\VID_v(4)&PID_d(4)&MI_z(2)
+;
+;  where z is bInterfaceNumber, plus these compatible IDs
+;
+;    USB\CLASS_d(2)&SUBCLASS_s(2)&PROT_p(2)
+;    USB\CLASS_d(2)&SUBCLASS_s(2)
+;    USB\CLASS_d(2)
+;    USB\COMPOSITE
+;
+;  taken from bInterfaceClass / bInterfaceSubClass / bInterfaceProtocol.
+;  For the Linux f_acm gadget the master interface reports 02 / 02 / 01
+;  (f_acm.c leaves the ACM protocol at its default,
+;  USB_CDC_ACM_PROTO_AT_V25TER = 1), so the concrete compatible IDs are
+;  USB\Class_02&SubClass_02&Prot_01 and USB\Class_02&SubClass_02.
+;
+;  "USB Serial Driver (Usbser.sys)" (Microsoft) states that Windows binds
+;  the in-box usbser.sys on exactly such a compatible ID match. Listing
+;  the compatible IDs is therefore what lets the ranking engine find this
+;  INF without the user pointing at it.
+;
+;  CORRECTION TO AN EARLIER REVISION OF THIS COMMENT
+;  -------------------------------------------------
+;  The &Cdc_02 hardware ID form does exist, but it is NOT the XP path.
+;  Per "Support for the Wireless Mobile Communication Device Class"
+;  (Microsoft), the CDC/WMCDC hardware IDs
+;    USB\Vid_%04x&Pid_%04x&Cdc_02&MI_%02x
+;    USB\Vid_%04x&Pid_%04x&Cdc_02
+;  are generated only when CDC/WMCDC enumeration is explicitly enabled in
+;  usbccgp.sys by setting the EnumeratorClass registry value (02,00,00) in
+;  the generic parent's software key. That support was introduced in
+;  Windows Vista and is off by default. Nothing in this project sets
+;  EnumeratorClass, so on XP the collection is grouped by the IAD and gets
+;  the plain &MI_00 form documented above.
+;
+;  The &Cdc_02 entries are kept below anyway: they are inert when
+;  EnumeratorClass is unset, and they make this INF also match on a
+;  Vista-or-later machine where WMCDC enumeration happens to be enabled.
+;  They are not the reason the automatic match now works.
+;
+;  ALSO REQUIRED: WHERE THE INF FILE LIVES
+;  ---------------------------------------
+;  Hardware IDs alone cannot make an install automatic. Windows only
+;  ranks INF files that are inside its own search path, that is
+;  %SystemRoot%\inf plus any directory listed in
+;    HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\DevicePath
+;  An INF sitting on a USB stick or in a project folder is never found by
+;  the automatic search, no matter how correct its IDs are. Copy this file
+;  to %SystemRoot%\inf (see docs/README-windows.md) if you want the port
+;  to appear without answering the Found New Hardware wizard.
+;
+;  Hardware IDs always outrank compatible IDs in driver ranking, so
+;  listing both does not change which section wins. It only widens the
+;  set of enumeration paths that find this INF at all.
 ; ---------------------------------------------------------------------------
 
 ; Windows 2000 / XP / 2003 / Vista / 7 / 8 (32-bit)
 [DeviceList.NT]
+%DESCRIPTION% = DriverInstall.NT, USB\VID_1209&PID_0001&CDC_02&MI_00
+%DESCRIPTION% = DriverInstall.NT, USB\VID_1209&PID_0001&CDC_02
 %DESCRIPTION% = DriverInstall.NT, USB\VID_1209&PID_0001&MI_00
 %DESCRIPTION% = DriverInstall.NT, USB\VID_1209&PID_0001
 %DESCRIPTION% = DriverInstall.NT, USB\VID_1209&PID_0001&MI_02
+%DESCRIPTION% = DriverInstall.NT, USB\Class_02&SubClass_02&Prot_01
+%DESCRIPTION% = DriverInstall.NT, USB\Class_02&SubClass_02
 
 ; 64-bit (Vista and later). See the signing note at the top of this file.
 [DeviceList.NTamd64]
+%DESCRIPTION% = DriverInstall.NTamd64, USB\VID_1209&PID_0001&CDC_02&MI_00
+%DESCRIPTION% = DriverInstall.NTamd64, USB\VID_1209&PID_0001&CDC_02
 %DESCRIPTION% = DriverInstall.NTamd64, USB\VID_1209&PID_0001&MI_00
 %DESCRIPTION% = DriverInstall.NTamd64, USB\VID_1209&PID_0001
 %DESCRIPTION% = DriverInstall.NTamd64, USB\VID_1209&PID_0001&MI_02
+%DESCRIPTION% = DriverInstall.NTamd64, USB\Class_02&SubClass_02&Prot_01
+%DESCRIPTION% = DriverInstall.NTamd64, USB\Class_02&SubClass_02
 
 ; The undecorated [DeviceList] is a fallback for older setupapi versions
 ; (Windows 2000) that do not honour the TargetOSVersion decorations.
 [DeviceList]
+%DESCRIPTION% = DriverInstall.NT, USB\VID_1209&PID_0001&CDC_02&MI_00
+%DESCRIPTION% = DriverInstall.NT, USB\VID_1209&PID_0001&CDC_02
 %DESCRIPTION% = DriverInstall.NT, USB\VID_1209&PID_0001&MI_00
 %DESCRIPTION% = DriverInstall.NT, USB\VID_1209&PID_0001
 

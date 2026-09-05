@@ -1223,6 +1223,7 @@ make -f Makefile.linux help
 | `scripts/99-vmodem.rules` | `/dev/ttyGS0` 出現を契機に systemd unit を起動 |
 | `scripts/vmodem.service` | 実際に `vmodem` を動かす unit |
 | `windows/vim1modem.inf` | Windows XP 側で COM ポートとして認識させる INF (Step 8-a) |
+| `windows/vim1modem-modem.inf` | その COM ポート上にモデムを登録する INF。DCB の `fOutxCtsFlow=0` で RAS 692 を回避する (Step 10-c) |
 
 ### `bDeviceClass = 0xEF` —— Windows で COM ポートとして見えるかの分かれ目
 
@@ -1622,6 +1623,242 @@ Step 6 と同じです。
 
 ---
 
+## Step 10: Windows XP で INF が自動で当たらず、ダイアルすると 692
+
+### 症状
+
+1. Windows XP で **INF が自動で当たらない**。手動で当てるしかない
+2. 手動で当ててモデムとして設定し、ダイアルアップすると **RAS エラー 692**
+   (「ポートまたは接続されているデバイスでハードウェア障害が発生しました」)
+3. その時 **VIM1 側のログには通話開始も通信も一切出ない**。待機のまま
+4. **Windows 11 では同じ構成で正常にダイアルできる**
+
+「Win11 では動くのだから、おま環では」と片付けたくなりますが、
+調べた結果 **XP 側の環境問題ではなく、本プロジェクトの Windows 側
+デバイス定義の欠陥**でした。以下、一次資料で確定させた事実だけを書きます。
+
+### 10-a: なぜ INF が自動で当たらなかったか
+
+#### 事実: 互換 ID を 1 つも書いていなかった
+
+Microsoft の "USB Serial Driver (Usbser.sys)" が明記している通り、CDC-ACM
+デバイスは**互換 ID** `USB\Class_02&SubClass_02` で `usbser.sys` に結び付きます。
+「Standard USB Identifiers」の規定では、複合デバイスの各インタフェースに対して
+Windows は次を生成します。
+
+| 種別 | 生成される ID |
+|---|---|
+| ハードウェア ID | `USB\VID_v(4)&PID_d(4)&MI_z(2)` |
+| 互換 ID | `USB\CLASS_d(2)&SUBCLASS_s(2)&PROT_p(2)` |
+| 互換 ID | `USB\CLASS_d(2)&SUBCLASS_s(2)` |
+| 互換 ID | `USB\CLASS_d(2)` |
+| 互換 ID | `USB\COMPOSITE` |
+
+修正前の `vim1modem.inf` には **ハードウェア ID しか書いていません**でした。
+ハードウェア ID は VID/PID に完全一致した時にしか当たらないため、
+「その INF を手で指定した時だけ入る」= 自動では当たらない、という
+そのままの結果になっていました。互換 ID を追加して解決しています。
+
+```ini
+[DeviceList.NT]
+%DESCRIPTION% = DriverInstall.NT, USB\VID_1209&PID_0001&MI_00
+%DESCRIPTION% = DriverInstall.NT, USB\VID_1209&PID_0001
+%DESCRIPTION% = DriverInstall.NT, USB\VID_1209&PID_0001&MI_02
+%DESCRIPTION% = DriverInstall.NT, USB\Class_02&SubClass_02&Prot_01   ; ← 追加
+%DESCRIPTION% = DriverInstall.NT, USB\Class_02&SubClass_02           ; ← 追加
+```
+
+#### 訂正: `&Cdc_02` は XP の経路ではない
+
+調査の途中で「XP は `USB\VID_xxxx&PID_xxxx&Cdc_02` の形で来るのでは」と
+考えましたが、**これは誤り**でした。Microsoft "Support for Interface
+Collections" によれば、`&Cdc_02` 形式の ID を `usbccgp.sys` が生成するのは
+**そのソフトウェアキーに `EnumeratorClass` (`02,00,00`) が設定されている時だけ**で、
+既定では無効です。さらに WMCDC のサポート自体が **Windows Vista 以降**です。
+本プロジェクトは `EnumeratorClass` をどこにも設定していないので、
+XP は通常の `&MI_00` 形式で列挙します。
+
+INF には `&Cdc_02` の行も残してありますが、これは **XP では単に一致しない
+不活性な行**であり、将来 `EnumeratorClass` を使う構成にした場合の保険です。
+「これが効いている」という説明をしてはいけません。
+
+#### もう 1 つの必要条件: INF の置き場所
+
+Windows がドライバを自動で探すのは `%SystemRoot%\inf` と、
+`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\DevicePath` に登録された
+ディレクトリだけです。プロジェクトフォルダに置いた INF は、
+**互換 ID が正しくても永久に自動では見つかりません**。
+`windows\vim1modem.inf` を `C:\WINDOWS\inf\` にコピーしてください。
+
+### 10-b: 692 の真因 — CTS が永久に上がらない
+
+症状 2 と 3 は同じ 1 つの原因から来ています。**「AT コマンドが 1 バイトも
+送信されていない」**ため、VIM1 側のログが無音になり、XP は応答が無いので
+692 を返していました。なぜ送信されないかを 4 つの一次資料で確定させました。
+
+#### 事実 1: CDC-ACM の通知に CTS ビットは存在しない
+
+Linux v6.12 の `include/uapi/linux/usb/cdc.h` の SerialState 通知 (0x20) の定義:
+
+```c
+#define USB_CDC_SERIAL_STATE_DCD        (1 << 0)
+#define USB_CDC_SERIAL_STATE_DSR        (1 << 1)
+#define USB_CDC_SERIAL_STATE_BREAK      (1 << 2)
+#define USB_CDC_SERIAL_STATE_RING_SIGNAL (1 << 3)
+#define USB_CDC_SERIAL_STATE_FRAMING    (1 << 4)
+#define USB_CDC_SERIAL_STATE_PARITY     (1 << 5)
+#define USB_CDC_SERIAL_STATE_OVERRUN    (1 << 6)
+```
+
+DCD / DSR / BREAK / RING / FRAMING / PARITY / OVERRUN の 7 つだけで、
+**CTS は定義そのものが存在しません**。USB PSTN サブクラス仕様 v1.2 に
+CTS の規定が無いためで、これは実装の手抜きではなく**プロトコルの仕様**です。
+
+#### 事実 2: `f_acm.c` は DSR と DCD しか上げない
+
+```c
+/* drivers/usb/gadget/function/f_acm.c  acm_connect()  (v6.12) */
+acm->serial_state |= ACM_CTRL_DSR | ACM_CTRL_DCD;
+```
+
+事実 1 の通り上げようが無いので当然です。
+
+#### 事実 3: `usbser.sys` は RTS/CTS を扱わない
+
+Keil の "USBSER.SYS quirks explained" が挙げる既知の癖のうち (c):
+
+> **RTS changes just with DTR setting.**
+
+Microsoft Q&A の "Virtual serial port (USBSER.SYS) is not sending RTS/CTS"
+でも同じ挙動が報告されています。
+
+#### 事実 4: Windows 内蔵「標準モデム」は CTS を待つ設定になっている ★
+
+これが決め手でした。Microsoft WDK の "Locking the Port Speed (DCB)" が
+`MdmHayes.inf` の DCB を引用しています。
+
+```ini
+HKR,, DCB, 1, 1C,00,00,00, 80,25,00,00, 15,20,00,00, ...
+```
+
+3 番目の DWORD がビットフィールドで、リトルエンディアンなので
+`15,20,00,00` = **`0x00002015`**。Win32 の `DCB` 構造体のビット配置に
+当てはめて展開します。
+
+| ビット | メンバ | 値 |
+|---|---|---|
+| 0 | `fBinary` | 1 |
+| 1 | `fParity` | 0 |
+| **2** | **`fOutxCtsFlow`** | **1** |
+| 3 | `fOutxDsrFlow` | 0 |
+| 4-5 | `fDtrControl` | 1 (`DTR_CONTROL_ENABLE`) |
+| 12-13 | `fRtsControl` | 2 (`RTS_CONTROL_HANDSHAKE`) |
+
+`fOutxCtsFlow` について Microsoft は次のように規定しています。
+
+> If this member is TRUE and CTS is turned off, output is suspended until
+> CTS is sent again.
+
+#### 因果の連鎖
+
+```
+Windows 内蔵「通信ケーブル経由の標準モデム」を選ぶ
+  -> DCB の fOutxCtsFlow = 1  (事実 4)
+  -> シリアルドライバは CTS が上がるまで送信を保留する
+  -> しかし CDC-ACM に CTS を上げる手段は存在しない  (事実 1・2・3)
+  -> unimodem の初期化文字列もダイアル文字列も 1 バイトも送信されない
+  -> VIM1 は 1 バイトも受信しない = ログが待機のまま  (症状 3)
+  -> XP はモデムが応答しないと判断し RAS 692 を返す  (症状 2)
+```
+
+Windows 11 の `usbser.sys` は KMDF で書き直されており、この挙動を示しません。
+**症状 4 (Win11 では動く) はこの差で説明が付きます。**
+つまり「おま環」ではなく、XP を含む構成では必ず起きる設計上の欠陥です。
+
+### 10-c: 対策 — `windows/vim1modem-modem.inf`
+
+内蔵の「標準モデム」を使う限り DCB は `MdmHayes.inf` 由来のままなので、
+**自前のモデム INF を用意して DCB を上書き**します。
+
+```ini
+[Version]
+Class     = Modem
+ClassGuid = {4D36E96D-E325-11CE-BFC1-08002BE10318}
+
+; DCBlength=0x1C, BaudRate=115200, ビットマスク=0x00001011
+;   fBinary=1, fOutxCtsFlow=0 (★CTS を待たない), fDtrControl=1 (ENABLE),
+;   fRtsControl=1 (RTS_CONTROL_ENABLE ... HANDSHAKE ではない)
+HKR,, DCB, 1, 1C,00,00,00, 00,c2,01,00, 11,10,00,00, ...
+
+; Properties の 6 番目の DWORD = ModemOptions
+;   0x10 = ハードウェアフロー制御 / 0x20 = ソフトウェアフロー制御
+;   0x20 だけを立てる (0x10 は意図的に落とす)
+HKR,, Properties, 1, 00,00,00,00, 3c,00,00,00, 00,00,00,00, 07,00,00,00,
+                     0f,00,00,00, 20,00,00,00, 00,c2,01,00, 40,83,00,00
+```
+
+設計上の判断:
+
+* **`FlowControl_Hard` を定義しない**。定義するとプロパティ画面に
+  「ハードウェア」が選択肢として現れ、選ばれた瞬間に 692 が再発します。
+  Microsoft も「サポートしない設定は書かない」「`ModemOptions` と
+  一致させる」と規定しています。
+* **初期化文字列は `vm_at.c` が実装している AT だけ**にしました
+  (`AT&F E0 Q0 V1` / `AT&C1 &D2 &K0 S0=0`)。未実装の AT に `ERROR` を返すと、
+  unimodem はモデム全体を「応答しない」と見なしてダイアルを中止します。
+  `&K0` (フロー制御なし) を送る事で DCE 側の設定も揃えています。
+* **`Responses` は `vm_at.c` の `vm_at_result_text()` が実際に返す文字列と
+  1 対 1 で対応**させました。verbose と numeric の両方を登録しています。
+  知らない応答が来ると unimodem は待ち続けてタイムアウトします。
+* `Class=Modem` なので、COM ポートとして入っている `vim1modem.inf` を
+  **置き換えるのではなく、その上に載る**形になります。両方必要です。
+
+### 10-d: 沈黙したまま失敗させない (VIM1 側)
+
+この不具合が厄介なのは、**VIM1 側から見ると「何も起きていない」としか
+見えない**点です。エラーも出ず、ただログが止まっているだけなので、
+原因が Windows 側の DCB にあると気付くまでに時間がかかります。
+
+そこで `src/modem/vm_modem.c` に、**COMMAND 状態のまま 20 秒間 1 バイトも
+受信しなかったら、原因と対処を名指しした警告を 1 度だけ出す**処理を
+追加しました。
+
+```
+WRN modem: /dev/ttyGS0 を開いてから 20 秒、DTE から 1 バイトも受信していない
+WRN modem:   ホスト側が AT を送っていない可能性が高い (こちらの受信経路の問題ではない)
+WRN modem:   最有力: Windows のモデム定義がハードウェアフロー制御 (RTS/CTS) を要求している
+WRN modem:   CDC-ACM の SerialState 通知に CTS ビットは無く (uapi/linux/usb/cdc.h)、
+WRN modem:   f_acm は DSR|DCD しか上げない
+WRN modem:   -> DCB の fOutxCtsFlow=1 だと送信が永久に保留され、AT が 1 バイトも出ない
+WRN modem:   対処: windows/vim1modem-modem.inf を入れる (fOutxCtsFlow=0)
+```
+
+20 秒という値は「RAS のモデム応答待ちより長く、利用者が反応が無いと感じるより
+短い」ところに置いています。短すぎると、接続したまま放置している正常な
+ケースで誤警告になります。警告は 1 度きりで、毎周期は出しません。
+
+### 10-e: Step 10 のテスト
+
+`tests/test_linux_step78.c` に `test_step8c_modem_inf()` を追加しました
+(20 項目)。**「効く条件」だけを検査する**方針です。
+
+| 検査 | 落ちると何が起きるか |
+|---|---|
+| `Class=Modem` / Modem クラス GUID / `unimdm.tsp` | TAPI から見えず、ダイアルアップの相手として選べない |
+| DCB に `11,10,00,00` がある | `fOutxCtsFlow` が 0 でない = **692 が再発** |
+| 有効行に `15,20,00,00` が無い | `MdmHayes.inf` の値を使ってしまっている |
+| `ModemOptions` = `20,00,00,00` | DCB と食い違い、プロパティ画面を開くと元に戻る |
+| `FlowControl_Hard` が**無い** | UI で選べてしまい、選ばれた瞬間に 692 が再発 |
+| `&K0` / `&C1` / `&D2` を送る | DCE 側のフロー制御設定が揃わない |
+| 応答 `NO CARRIER` / `NO DIALTONE` / `CONNECT 33600` | unimodem が応答を解釈できず待ち続ける |
+| 全体が ASCII / 改行が CRLF | XP の setupapi は ANSI 読みなので化ける |
+| `.cat` が無いのに `CatalogFile` を書いていない | 署名検証で失敗する |
+
+`vim1modem.inf` 側にも `Class_02&SubClass_02` の存在を assert する項目を
+追加しています (これが無いと 10-a の症状に戻ります)。
+
+---
+
 
 ## ビルドに必要なもの
 
@@ -1699,13 +1936,16 @@ scripts/
                            Step 9 で CAP_NET_RAW と ping_group_range を追加)
   99-vmodem.conf         ★sysctl 恒久設定 (Step 9。ping_group_range)
 windows/
-  vim1modem.inf          ★Windows XP 用 INF (Step 8-a。ASCII + CRLF 必須)
+  vim1modem.inf          ★Windows XP 用 INF (Step 8-a。ASCII + CRLF 必須。
+                           Step 10-a で互換 ID Class_02&SubClass_02 を追加)
+  vim1modem-modem.inf    ★Windows 用モデム INF (Step 10-c。RAS 692 の対策。
+                           DCB の fOutxCtsFlow=0 が本体)
 tests/
   test_linux_port.c      ★Step 1・2 の検証
   test_linux_step34.c    ★Step 3・4 の検証
   test_linux_step5.c     ★Step 5・5-a の検証
   test_linux_step6.c     ★Step 6-a・6-b・6-c の検証
-  test_linux_step78.c    ★Step 7・8・8-a の検証
+  test_linux_step78.c    ★Step 7・8・8-a・8-c (Step 10) の検証
                            (ガジェットスクリプトを VM_TEST_ROOT で実行して
                             冪等性・teardown 順序まで実測する)
   test_dnsfix.c          ★Step 9 の検証 (resolv.conf 解析 12 ケース /

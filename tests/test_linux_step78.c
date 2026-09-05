@@ -855,6 +855,160 @@ static void test_step8a_inf(void)
               lone_lf);
     }
 
+    /*
+     * 自動で当たるための互換 ID (難所 12)。
+     *
+     * Microsoft "USB Serial Driver (Usbser.sys)" によれば、CDC-ACM は
+     * 互換 ID USB\Class_02&SubClass_02 で usbser.sys に結び付く。
+     * ハードウェア ID (VID/PID) しか書いていないと、そのハードウェア ID
+     * に完全一致した時しか当たらない = 実質「手動で当てる」になる。
+     * XP で自動認識されなかった直接の原因がこれ。
+     */
+    check(contains_ci(inf, "Class_02&SubClass_02"),
+          "互換 ID USB\\Class_02&SubClass_02 がある "
+          "(これが無いと自動で当たらない)");
+
+    free(inf);
+}
+
+/* ==========================================================================
+ * Step 8-c: windows/vim1modem-modem.inf (RAS 692 対策)
+ * ==========================================================================
+ * XP で「手動で INF を当ててモデムに設定 → ダイアルすると 692、
+ * VIM1 側のログは待機のまま」という症状の対策ファイル。
+ *
+ * 原因の連鎖 (一次資料で確認済み):
+ *   (1) CDC-ACM の SerialState 通知 (0x20) に CTS ビットは存在しない
+ *       -- include/uapi/linux/usb/cdc.h (Linux v6.12) に定義が無い
+ *   (2) f_acm.c の acm_connect() は DSR|DCD しか立てない
+ *   (3) usbser.sys は RTS/CTS を扱わない (Keil "USBSER.SYS quirks":
+ *       "RTS changes just with DTR setting.")
+ *   (4) Windows 内蔵「標準モデム」の DCB は MdmHayes.inf 由来で
+ *       ビットマスク 0x00002015 = fOutxCtsFlow=1, fRtsControl=2
+ *       (RTS_CONTROL_HANDSHAKE)
+ *
+ *   -> fOutxCtsFlow=1 かつ CTS が永久に上がらない
+ *   -> シリアルドライバが送信を保留し続ける
+ *   -> AT が 1 バイトも出ない
+ *   -> VIM1 のログは無音、XP は 692
+ *
+ * よってこの INF は fOutxCtsFlow=0 でなければ意味が無い。
+ * ここではその「効く条件」だけを検査する。
+ * ========================================================================== */
+static void test_step8c_modem_inf(void)
+{
+    char  *inf;
+    size_t len, i;
+    int    non_ascii = 0;
+
+    head("Step 8-c: windows/vim1modem-modem.inf (692 対策)");
+
+    if (!file_exists("windows/vim1modem-modem.inf")) {
+        skip("windows/vim1modem-modem.inf が無いので省略");
+        return;
+    }
+    inf = slurp("windows/vim1modem-modem.inf", &len);
+    if (!inf) { skip("windows/vim1modem-modem.inf を読めない"); return; }
+
+    check(len > 0, "ファイルが空でない (%lu バイト)", (unsigned long)len);
+
+    /* --- モデムクラスとして登録される事 --- */
+    check(contains_ci(inf, "Class") && contains_ci(inf, "Modem"),
+          "Class=Modem である (Ports ではなく TAPI モデムとして入る)");
+    check(contains_ci(inf, "4D36E96D-E325-11CE-BFC1-08002BE10318"),
+          "Modem クラス GUID {4D36E96D-...} がある");
+    check(contains_ci(inf, "unimdm.tsp"),
+          "FriendlyDriver=unimdm.tsp がある (TAPI から見える条件)");
+
+    /*
+     * ★ 692 対策の本体 ★
+     * DCB のビットマスクは 3 番目の DWORD。リトルエンディアンなので
+     * 0x00001011 は "11,10,00,00" と並ぶ。
+     *   bit2  fOutxCtsFlow = 0  <- CTS を待たない (これが本命)
+     *   bit4  fDtrControl  = 1  (DTR_CONTROL_ENABLE)
+     *   bit12 fRtsControl  = 1  (RTS_CONTROL_ENABLE, HANDSHAKE ではない)
+     */
+    check(contains_ci(inf, "HKR,, DCB") || contains_ci(inf, "HKR,,DCB"),
+          "DCB を明示している (標準モデムの既定値を上書きする)");
+    check(contains_ci(inf, "11,10,00,00"),
+          "DCB ビットマスクが 0x00001011 = fOutxCtsFlow=0 "
+          "(★ CTS を待たない = 692 の直接対策)");
+    /*
+     * MdmHayes.inf の 0x00002015 は「対比のため」ヘッダのコメントに
+     * 引用してある。有効行に出てきたら本物の設定なので落とす。
+     */
+    check(!contains_in_code(inf, "15,20,00,00", ';'),
+          "MdmHayes.inf の 0x00002015 (fOutxCtsFlow=1) を "
+          "有効行では使っていない (コメントの引用のみ)");
+
+    /*
+     * Properties の 6 番目の DWORD が ModemOptions。
+     *   0x10 = ハードウェアフロー制御, 0x20 = ソフトウェアフロー制御
+     * ハードウェア側のビットを立てると DCB と食い違い、
+     * ユーザがプロパティ画面を開いた時に元に戻される。
+     */
+    check(contains_ci(inf, "HKR,, Properties") ||
+          contains_ci(inf, "HKR,,Properties"),
+          "Properties がある");
+    check(contains_ci(inf, "20,00,00,00"),
+          "ModemOptions=0x20 (ソフトウェアフロー制御のみ。"
+          "0x10 のハードウェアフロー制御ビットは立てない)");
+
+    /*
+     * FlowControl_Hard を書くと UI に「ハードウェア」が選択肢として出る。
+     * CTS が上がらない以上、選ばれた瞬間に同じ症状が再発する。
+     * だから「書かない」事自体が仕様。
+     */
+    check(!contains_in_code(inf, "FlowControl_Hard", ';'),
+          "FlowControl_Hard を定義していない "
+          "(選べてしまうと 692 が再発するため意図的に省く)");
+    check(contains_ci(inf, "FlowControl_Off"),
+          "FlowControl_Off がある");
+
+    /*
+     * 初期化文字列は vm_at.c が実装している AT だけを使う事。
+     * 未実装の AT に ERROR を返すと、unimodem はモデム全体を
+     * 「応答しない」と判断してダイアルを中止する。
+     * &K0 = フロー制御なし。vm_at.c の '&' ハンドラが受け付ける。
+     */
+    check(contains_ci(inf, "&K0"),
+          "初期化で &K0 (フロー制御なし) を送る "
+          "-> DCE 側も CTS/RTS を使わない事で揃う");
+    check(contains_ci(inf, "&C1"), "&C1 (DCD はキャリアに追従) を送る");
+    check(contains_ci(inf, "&D2"), "&D2 (DTR 落ちで切断) を送る");
+
+    /*
+     * Responses は vm_at.c の vm_at_result_text() が実際に返す文字列と
+     * 一致していなければならない。知らない応答が来ると unimodem は
+     * 待ち続けてタイムアウトする。
+     */
+    check(contains_ci(inf, "NO CARRIER"), "応答 NO CARRIER を登録している");
+    check(contains_ci(inf, "NO DIALTONE"), "応答 NO DIALTONE を登録している");
+    check(contains_ci(inf, "CONNECT 33600"),
+          "応答 CONNECT 33600 を登録している (config.ini の既定速度)");
+
+    /* --- XP の setupapi は ANSI 読み。非 ASCII は入れられない --- */
+    for (i = 0; i < len; i++) {
+        if ((unsigned char)inf[i] > 0x7f) non_ascii++;
+    }
+    check(non_ascii == 0,
+          "全体が ASCII のみ (非 ASCII バイト %d 個)", non_ascii);
+
+    {
+        int lone_lf = 0;
+        for (i = 0; i < len; i++) {
+            if (inf[i] == '\n' && (i == 0 || inf[i - 1] != '\r')) lone_lf++;
+        }
+        check(lone_lf == 0,
+              "改行が全て CRLF (LF 単独 %d 個)", lone_lf);
+    }
+
+    /* 未署名で配る前提。.cat が無いのに CatalogFile を書くと XP で失敗する */
+    if (!file_exists("windows/vim1modem-modem.cat")) {
+        check(!contains_in_code(inf, "CatalogFile", ';'),
+              ".cat が無く CatalogFile も書いていない (整合している)");
+    }
+
     free(inf);
 }
 
@@ -1030,6 +1184,7 @@ int main(void)
     test_step8_gadget_behavior();
     test_step8_udev_systemd();
     test_step8a_inf();
+    test_step8c_modem_inf();
     test_cross_references();
     test_hardware_dependent();
 

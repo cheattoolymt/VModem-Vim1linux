@@ -1,0 +1,364 @@
+; ===========================================================================
+;  vim1modem-modem.inf -- Installs the VIM1 VModem as a MODEM (TAPI) device
+;                         on top of an existing COM port.
+;
+;  Companion file: vim1modem.inf installs the COM port itself (Class=Ports,
+;  usbser.sys). This file is the second half: it registers a TAPI modem on
+;  that port with settings that match what the VModem firmware actually
+;  implements.
+;
+;  Install this INSTEAD OF picking "Standard Modem" / "Standard 33600 bps
+;  Modem" from the built-in list.
+;
+;  NOTE ON LANGUAGE
+;  ----------------
+;  ASCII only, no Japanese text, same as vim1modem.inf: XP setupapi reads
+;  INF files as ANSI in the system code page, so multi-byte comments can be
+;  mangled and in the worst case break parsing. Japanese design notes live
+;  in docs/README-windows.md. tests/test_linux_step78.c enforces this.
+;
+;  ===========================================================================
+;  WHY THIS FILE EXISTS: RAS ERROR 692 ON WINDOWS XP
+;  ===========================================================================
+;
+;  Reported symptom
+;  ----------------
+;    * Windows XP: the port installs, a "Standard Modem" is configured on
+;      it, dialling fails immediately with RAS error 692 ("There was a
+;      hardware failure in the modem or other connecting device").
+;    * At the same time the VModem log on the VIM1 shows NOTHING: no dial
+;      request, no AT command, no traffic. It stays in the waiting state.
+;    * Windows 11 dials the same gadget successfully.
+;
+;  "The device log is completely silent" is the decisive clue. It means the
+;  host never transmitted a single byte. So the failure happens before any
+;  AT command is issued -- it is not an AT parsing or a PPP problem.
+;
+;  Fact 1: the CDC-ACM protocol has no CTS
+;  ---------------------------------------
+;  The device->host status notification for CDC-ACM is SERIAL_STATE
+;  (bNotification 0x20). Its bitmap is defined in the Linux UAPI header
+;  include/uapi/linux/usb/cdc.h (checked against v6.12) as:
+;
+;    USB_CDC_SERIAL_STATE_DCD, _DSR, _BREAK, _RING_SIGNAL,
+;    USB_CDC_SERIAL_STATE_FRAMING, _PARITY, _OVERRUN
+;
+;  There is no CTS bit in that list. CTS is simply not part of the
+;  abstract control model. A CDC-ACM device therefore cannot assert CTS,
+;  no matter how it is implemented. (Confirmed independently on the vendor
+;  side: an ST community thread titled "CTS signal on USB CDC" reaches the
+;  same conclusion -- "there is no provision for CTS in USBD PSTN v1.2".)
+;
+;  Fact 2: the gadget only ever reports DSR and DCD
+;  ------------------------------------------------
+;  Linux drivers/usb/gadget/function/f_acm.c, acm_connect():
+;
+;    acm->serial_state |= USB_CDC_SERIAL_STATE_DSR
+;                       | USB_CDC_SERIAL_STATE_DCD;
+;
+;  and acm_disconnect() clears exactly those two bits. Nothing else is ever
+;  reported upstream. Matching the protocol limitation above.
+;
+;  Fact 3: usbser.sys mishandles RTS/CTS
+;  -------------------------------------
+;  Known and long-standing. Two independent reports:
+;    * Microsoft Q&A, "Virtual serial port (USBSER.SYS) is not sending
+;      RTS/CTS": DTR is handled correctly, RTS state is only pushed to the
+;      device when DTR changes.
+;    * Keil / Arm community, "USBSER.SYS quirks explained", item (c):
+;      "RTS changes just with DTR setting."
+;  A third report (techtalkz) contains the Bus Hound capture showing the
+;  missing SET_CONTROL_LINE_STATE transfer on XP SP2 specifically.
+;
+;  Fact 4: standard Windows modems ask for hardware flow control
+;  -------------------------------------------------------------
+;  Microsoft's own reference modem INF, MdmHayes.inf, is quoted in the WDK
+;  documentation topic "Locking the Port Speed (DCB)" as:
+;
+;    HKR,, DCB, 1, 1C,00,00,00, 80,25,00,00, 15,20,00,00, ...
+;                  ^DCBlength   ^BaudRate    ^bit mask
+;
+;  The bit mask is the little-endian DWORD 0x00002015. Decoded against the
+;  Win32 DCB layout (winbase.h / "DCB structure" on Microsoft Learn):
+;
+;    fBinary        = 1
+;    fOutxCtsFlow   = 1   <-- monitor CTS for output flow control
+;    fDtrControl    = 1   (DTR_CONTROL_ENABLE)
+;    fRtsControl    = 2   (RTS_CONTROL_HANDSHAKE)
+;
+;  fOutxCtsFlow = 1 is documented as: "If this member is TRUE and CTS is
+;  turned off, output is suspended until CTS is sent again."
+;
+;  Conclusion
+;  ----------
+;  Chain the four facts together:
+;
+;    standard modem entry  -> fOutxCtsFlow = 1
+;    CDC-ACM               -> CTS can never be asserted
+;    usbser.sys            -> reports CTS as low / does not track it
+;    serial driver         -> output suspended forever
+;    unimodem              -> the init/dial AT string is never transmitted
+;    VIM1                  -> sees zero bytes, log stays in "waiting"
+;    RAS                   -> gives up, reports 692
+;
+;  Every observed symptom is accounted for, including why the VIM1 log is
+;  empty rather than showing a rejected command. It is not "works on my
+;  machine only" -- XP behaves per the documented DCB semantics.
+;
+;  The fix is therefore host-side and it is a configuration fix, not a
+;  firmware fix: the modem must be described to Windows as a device with
+;  NO hardware flow control. That is what this INF does:
+;
+;    * DCB with fOutxCtsFlow = 0 and fRtsControl = RTS_CONTROL_ENABLE
+;      (assert RTS and leave it, never use it as a handshake).
+;    * ModemOptions advertises software flow control only, so unimodem
+;      never offers or selects RTS/CTS.
+;    * FlowControl_Off is the only flow-control command string that maps to
+;      a real capability of the emulator.
+;
+;  Why Windows 11 already worked: its usbser.sys is a rewritten
+;  KMDF driver and does not exhibit the XP-era CTS behaviour, so the
+;  standard modem entry happens to survive there. The XP failure is a real
+;  defect in this project's Windows-side description of the device, not an
+;  XP bug, which is why it is fixed here rather than worked around.
+; ===========================================================================
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = Modem
+ClassGuid   = {4D36E96D-E325-11CE-BFC1-08002BE10318}
+Provider    = %PROVIDER%
+; XP-era date on purpose, same reasoning as vim1modem.inf.
+DriverVer   = 04/01/2009,5.1.2600.0
+; CatalogFile is deliberately omitted: no .cat is shipped (unsigned).
+
+[Manufacturer]
+%PROVIDER% = DeviceList, NT, NTamd64
+
+; ---------------------------------------------------------------------------
+;  Models
+;
+;  A modem installed on top of a COM port is not PnP-enumerated, so there is
+;  no real hardware ID to match. Microsoft's own sample modem INF (smpdata.inf,
+;  quoted in "Modifying the add-registry-sections of smpdata.inf") uses a
+;  "*"-prefixed pseudo ID for exactly this case:
+;
+;    [Microsoft]
+;    %Modem1% = Modem1, SERENUM\MSFT5600
+;    %Modem1% = Modem1, *MSFT5600
+;
+;  The same convention is used here. The entry is selected by hand from the
+;  modem list (Control Panel -> Phone and Modem Options -> Add -> "Don't
+;  detect my modem" -> Have Disk), which is the documented flow for a modem
+;  that sits on a COM port.
+; ---------------------------------------------------------------------------
+[DeviceList.NT]
+%VMODEM_DESC% = VModem, *VMODEM336
+
+[DeviceList.NTamd64]
+%VMODEM_DESC% = VModem, *VMODEM336
+
+; Undecorated fallback for setupapi versions that ignore the decorations.
+[DeviceList]
+%VMODEM_DESC% = VModem, *VMODEM336
+
+[VModem]
+AddReg = All, VModem.AddReg, FlowControl.Off, Responses.Verbose
+
+[VModem.NTamd64]
+AddReg = All, VModem.AddReg, FlowControl.Off, Responses.Verbose
+
+; ---------------------------------------------------------------------------
+;  Entries common to every modem installed by this INF
+; ---------------------------------------------------------------------------
+[All]
+HKR,, FriendlyDriver,, unimdm.tsp
+HKR,, DeviceType,  1, 01
+HKR,, PortSubClass, 1, 02
+HKR,, Contention,,   serial.vxd
+; InactivityScale of 1 means the InactivityTimeout value is in seconds.
+HKR,, InactivityScale, 1, 3c,00,00,00
+
+; ---------------------------------------------------------------------------
+;  The VModem itself
+; ---------------------------------------------------------------------------
+[VModem.AddReg]
+
+; --- Reset / init -------------------------------------------------------
+;  Command set kept to what src/modem/vm_at.c actually implements:
+;  ATZ, AT&F, ATE, ATV, AT&C, AT&D, AT&K, ATS<n>=<v>, ATM, ATL, ATX, ATI,
+;  ATD, ATA, ATH, ATO, A/ and AT+MS.
+;
+;  &K0 selects "no flow control", which is the only honest setting for a
+;  CDC-ACM link (see the analysis at the top of this file). vm_at.c accepts
+;  &K<n> for any n and records it, so this is safe even though the emulator
+;  does not implement flow control at all.
+;
+;  Microsoft's "Init" topic asks for: factory defaults, no echo, result
+;  codes on, carrier tracking, DTR hangup, no auto-answer. That maps to
+;  &F E0 Q0 V1 &C1 &D2 &K0 S0=0. Each Init line is kept under 40
+;  characters, as that topic requires.
+HKR,, Reset,,          "ATZ<cr>"
+HKR, Init, 1,,         "AT<cr>"
+HKR, Init, 2,,         "AT&F E0 Q0 V1<cr>"
+HKR, Init, 3,,         "AT&C1 &D2 &K0 S0=0<cr>"
+
+HKR,, Answer,,         "ATA<cr>"
+HKR,, Hangup,,         "ATH<cr>"
+HKR, Monitor, 1,,      "ATS0=0<cr>"
+HKR, Monitor, 2,,      "None"
+
+; --- Dial strings -------------------------------------------------------
+;  vm_number_normalize() strips everything that is not a digit before the
+;  number is matched against config.ini, so dial modifiers are harmless.
+;  Tone dialling only: pulse dialling has no meaning for the emulator.
+HKR, Settings, Prefix,,        "AT"
+HKR, Settings, Terminator,,    "<cr>"
+HKR, Settings, DialPrefix,,    "D"
+HKR, Settings, DialSuffix,,    ""
+HKR, Settings, Tone,,          "T"
+HKR, Settings, Pulse,,         "T"
+
+; --- Speaker ------------------------------------------------------------
+;  ATM0..M3 and ATL0..L3 are implemented in vm_at.c and drive the real
+;  dial tone / DTMF / handshake audio, so these are genuinely supported.
+HKR, Settings, SpeakerMode_Off,,    "M0"
+HKR, Settings, SpeakerMode_Dial,,   "M1"
+HKR, Settings, SpeakerMode_On,,     "M2"
+HKR, Settings, SpeakerMode_Setup,,  "M3"
+HKR, Settings, SpeakerVolume_Low,,  "L1"
+HKR, Settings, SpeakerVolume_Med,,  "L2"
+HKR, Settings, SpeakerVolume_High,, "L3"
+
+; --- Call setup timer ---------------------------------------------------
+;  S7 is the carrier wait, implemented as a plain S register.
+HKR, Settings, CallSetupFailTimer,, "S7=<#>"
+
+; --- Properties ---------------------------------------------------------
+;  Layout (WDK "Properties" topic), eight little-endian DWORDs:
+;
+;    DialOptions          00000000  no embedded '&' / '@' / 'W' support.
+;                                   vm_at.c discards dial modifiers, so
+;                                   claiming support would be false.
+;    CallSetupFailTimeout 0000003c  60 s, the S7 default in vm_at_reset().
+;    InactivityTimeout    00000000  feature not implemented.
+;    SpeakerVolume        00000007  low | medium | high.
+;    SpeakerMode          0000000f  off | dial | on | setup.
+;    ModemOptions         00000020  SOFTWARE flow control toggling only.
+;                                   *** THIS IS THE 692 FIX ***
+;                                   Bit 0x10 ("supports enabling/disabling
+;                                   of hardware flow control") is
+;                                   deliberately NOT set, because CDC-ACM
+;                                   has no CTS at all. With 0x10 clear,
+;                                   unimodem will not offer or select
+;                                   RTS/CTS for this device.
+;    MaxDTERate           0001c200  115200 bps host <-> gadget.
+;    MaxDCERate           00008340  33600 bps, the fastest entry in
+;                                   config.ini.
+HKR,, Properties, 1, 00,00,00,00, 3c,00,00,00, 00,00,00,00, 07,00,00,00, 0f,00,00,00, 20,00,00,00, 00,c2,01,00, 40,83,00,00
+
+; --- DCB ----------------------------------------------------------------
+;  Same field layout as the MdmHayes.inf example in the WDK topic
+;  "Locking the Port Speed (DCB)":
+;
+;    |DCBlength  |BaudRate   |bit mask   |Rsvd |XonLim|XofLim| | | |Xn|Xf|Er|Eo|Ev
+;
+;  DCBlength = 0x1C (28) and BaudRate = 115200 (0x0001C200).
+;
+;  The bit mask is the crux. 0x00001011 decodes as:
+;
+;    fBinary       = 1   required by Win32
+;    fParity       = 0
+;    fOutxCtsFlow  = 0   *** DO NOT WAIT FOR CTS ***
+;                        MdmHayes uses 1 here. Because a CDC-ACM device
+;                        can never assert CTS, a 1 makes the serial driver
+;                        suspend output forever and RAS reports 692 while
+;                        the VIM1 never receives a byte.
+;    fOutxDsrFlow  = 0   f_acm does raise DSR, but gating output on it adds
+;                        a second way to deadlock for no benefit.
+;    fDtrControl   = 1   DTR_CONTROL_ENABLE. Raise DTR and leave it up.
+;                        vm_serial_get_dtr_linux() cannot read DTR over
+;                        CDC-ACM (gs_tty_ops has no tiocmget, so TIOCMGET
+;                        fails with ENOTTY) and returns true, so DTR
+;                        handshaking would be meaningless here.
+;    fRtsControl   = 1   RTS_CONTROL_ENABLE, not RTS_CONTROL_HANDSHAKE.
+;                        Asserted once and left alone. This also sidesteps
+;                        the documented usbser.sys defect where RTS is only
+;                        pushed to the device when DTR changes.
+;    fOutX / fInX  = 0   No XON/XOFF: the link carries PPP frames, which
+;                        are binary, so byte-stuffing flow control would
+;                        corrupt them.
+;
+;  Everything after the mask is copied unchanged from the Microsoft
+;  example: 8 data bits, no parity, 1 stop bit, XON 0x11, XOFF 0x13.
+HKR,, DCB, 1, 1C,00,00,00, 00,c2,01,00, 11,10,00,00, 00,00, 0a,00, 0a,00, 08, 00, 00, 11, 13, 00, 00, 00
+
+; ---------------------------------------------------------------------------
+;  Flow control
+;
+;  Per the WDK topic "FlowControl_Off, FlowControl_Hard, FlowControl_Soft":
+;  "Do not include a flow control INF entry if the modem does not support
+;  any FlowControl settings. The supported commands must be indicated in
+;  the ModemOptions member."
+;
+;  ModemOptions above advertises software flow control only, so only
+;  FlowControl_Off and FlowControl_Soft are listed. FlowControl_Hard is
+;  intentionally absent -- there is no RTS/CTS to turn on.
+; ---------------------------------------------------------------------------
+[FlowControl.Off]
+HKR, Settings, FlowControl_Off,,   "&K0"
+HKR, Settings, FlowControl_Soft,,  "&K0"
+
+; ---------------------------------------------------------------------------
+;  Responses
+;
+;  Structure (WDK "Responses" topic):
+;    BYTE  bResponseState
+;    BYTE  bNegotiatedOptions
+;    DWORD dwNegotiatedDCERate
+;    DWORD dwNegotiatedDTERate
+;
+;  bResponseState: 00 OK, 02 Connect, 03 Error, 04 No Carrier,
+;                  05 No Dialtone, 06 Busy, 07 No Answer, 08 Ring.
+;
+;  The strings below are exactly what vm_at_result_text() and
+;  vm_at_emit_connect() in src/modem/vm_at.c produce. vm_at_reset() sets
+;  verbose (ATV1) as the default and the Init string above keeps V1, so the
+;  verbose forms are authoritative. The numeric forms are listed as well
+;  because the WDK topic notes that a modem may still be in a numeric
+;  response state during the first few init commands.
+;
+;  The CONNECT speeds match the [isp*] speed= values in config.ini
+;  (33600 / 28800 / 14400 / 2400). dwNegotiatedDTERate is left 0 so that
+;  unimodem keeps the port speed locked at 115200 instead of following the
+;  line rate.
+; ---------------------------------------------------------------------------
+[Responses.Verbose]
+HKR, Responses, "<cr><lf>OK<cr><lf>",              1, 00, 00, 00,00,00,00, 00,00,00,00
+HKR, Responses, "<cr><lf>ERROR<cr><lf>",           1, 03, 00, 00,00,00,00, 00,00,00,00
+HKR, Responses, "<cr><lf>NO CARRIER<cr><lf>",      1, 04, 00, 00,00,00,00, 00,00,00,00
+HKR, Responses, "<cr><lf>NO DIALTONE<cr><lf>",     1, 05, 00, 00,00,00,00, 00,00,00,00
+HKR, Responses, "<cr><lf>BUSY<cr><lf>",            1, 06, 00, 00,00,00,00, 00,00,00,00
+HKR, Responses, "<cr><lf>NO ANSWER<cr><lf>",       1, 07, 00, 00,00,00,00, 00,00,00,00
+HKR, Responses, "<cr><lf>RING<cr><lf>",            1, 08, 00, 00,00,00,00, 00,00,00,00
+HKR, Responses, "<cr><lf>CONNECT<cr><lf>",         1, 02, 00, 00,00,00,00, 00,00,00,00
+HKR, Responses, "<cr><lf>CONNECT 2400<cr><lf>",    1, 02, 00, 60,09,00,00, 00,00,00,00
+HKR, Responses, "<cr><lf>CONNECT 14400<cr><lf>",   1, 02, 00, 40,38,00,00, 00,00,00,00
+HKR, Responses, "<cr><lf>CONNECT 28800<cr><lf>",   1, 02, 00, 80,70,00,00, 00,00,00,00
+HKR, Responses, "<cr><lf>CONNECT 33600<cr><lf>",   1, 02, 00, 40,83,00,00, 00,00,00,00
+; Numeric result codes (ATV0), in case the modem answers before V1 is set.
+HKR, Responses, "0<cr>",                           1, 00, 00, 00,00,00,00, 00,00,00,00
+HKR, Responses, "1<cr>",                           1, 02, 00, 00,00,00,00, 00,00,00,00
+HKR, Responses, "2<cr>",                           1, 08, 00, 00,00,00,00, 00,00,00,00
+HKR, Responses, "3<cr>",                           1, 04, 00, 00,00,00,00, 00,00,00,00
+HKR, Responses, "4<cr>",                           1, 03, 00, 00,00,00,00, 00,00,00,00
+HKR, Responses, "6<cr>",                           1, 05, 00, 00,00,00,00, 00,00,00,00
+HKR, Responses, "7<cr>",                           1, 06, 00, 00,00,00,00, 00,00,00,00
+HKR, Responses, "8<cr>",                           1, 07, 00, 00,00,00,00, 00,00,00,00
+
+; ---------------------------------------------------------------------------
+;  Strings
+; ---------------------------------------------------------------------------
+[Strings]
+PROVIDER     = "VModem Project"
+VMODEM_DESC  = "VIM1 VModem 33600 (no flow control)"
