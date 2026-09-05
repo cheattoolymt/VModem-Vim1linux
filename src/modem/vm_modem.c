@@ -49,6 +49,67 @@
 /* ハングアップ時に PPP Terminate の完了を待つ上限 */
 #define VM_MODEM_TERM_WAIT_MS   1500
 
+/*
+ * 「1 バイトも受信しないまま」警告を出すまでの時間 (難所 12)
+ *
+ * ---------------------------------------------------------------------------
+ * なぜこの警告が必要か: Windows XP の RAS エラー 692 の切り分け
+ * ---------------------------------------------------------------------------
+ * 実際に報告された症状:
+ *
+ *   ・XP でポートは入る。標準モデムを載せてダイアルすると即 692
+ *     (「モデムまたはその他の接続デバイスでハードウェアの障害」)
+ *   ・同時に VModem 側のログは【何も出ない】。発呼要求も AT も通信も
+ *     出ず COMMAND のまま。
+ *   ・同じガジェットに Windows 11 からは正常に繋がる。
+ *
+ * 「デバイス側ログが完全に無音」が決定的な手がかりで、これは
+ * 「ホストが 1 バイトも送信していない」事を意味する。つまり AT の
+ * 解釈や PPP より手前で止まっている。
+ *
+ * 原因は 4 つの一次情報を繋ぐと確定する:
+ *
+ *  (1) CDC-ACM に CTS は存在しない。
+ *      デバイス→ホストの状態通知 SERIAL_STATE (0x20) のビットマップは
+ *      include/uapi/linux/usb/cdc.h (v6.12 実物) で
+ *        DCD / DSR / BREAK / RING_SIGNAL / FRAMING / PARITY / OVERRUN
+ *      と定義されており、CTS のビットが無い。プロトコル上、CDC-ACM
+ *      デバイスは CTS を上げる手段を持たない。
+ *
+ *  (2) f_acm は DSR と DCD しか通知しない。
+ *      drivers/usb/gadget/function/f_acm.c acm_connect():
+ *        acm->serial_state |= USB_CDC_SERIAL_STATE_DSR | ..._DCD;
+ *
+ *  (3) usbser.sys は RTS/CTS を正しく扱わない。
+ *      Microsoft Q&A "Virtual serial port (USBSER.SYS) is not sending
+ *      RTS/CTS"、および Keil/Arm "USBSER.SYS quirks explained" の
+ *      項目 (c) "RTS changes just with DTR setting."
+ *
+ *  (4) Windows の標準モデムは既定でハードウェアフロー制御を要求する。
+ *      WDK の "Locking the Port Speed (DCB)" が引用する MdmHayes.inf の
+ *        HKR,, DCB, 1, 1C,00,00,00, 80,25,00,00, 15,20,00,00, ...
+ *      のビットマスクは 0x00002015。Win32 DCB のビット配置で解くと
+ *        fOutxCtsFlow = 1  (CTS を出力フロー制御に使う)
+ *        fRtsControl  = 2  (RTS_CONTROL_HANDSHAKE)
+ *      で、fOutxCtsFlow=1 は公式に「CTS が下がっている間は送信を中断」。
+ *
+ * この 4 つが繋がると:
+ *
+ *   標準モデム -> fOutxCtsFlow=1 -> CDC-ACM は CTS を上げられない
+ *   -> シリアルドライバが送信を永久に保留 -> AT が 1 バイトも出ない
+ *   -> VIM1 のログは無音のまま -> RAS は諦めて 692
+ *
+ * 対処は windows/vim1modem-modem.inf (fOutxCtsFlow=0 のモデム定義) だが、
+ * 利用者が古い設定のまま繋いだ時に「ログが無音」という最も分かりにくい
+ * 形で失敗する。そこで一定時間 1 バイトも来なければ、原因と対処を名指し
+ * した警告を 1 度だけ出す。憶測を促す沈黙より、事実を指す 1 行が良い。
+ *
+ * 20 秒の根拠: RAS のモデム応答待ちより長く、利用者が「反応が無い」と
+ * 感じるより短い。短すぎると、繋いだまま放置している正常なケースで
+ * 誤警告になる。
+ */
+#define VM_MODEM_SILENT_WARN_MS 20000
+
 /* --------------------------------------------------------------------------
  * 実体
  * -------------------------------------------------------------------------- */
@@ -76,6 +137,13 @@ struct vm_modem_s {
 
     /* HANGING_UP の期限 */
     uint32_t term_deadline_ms;
+
+    /*
+     * 無音検出 (難所 12)。ポートを開いた時刻と、警告済みフラグ。
+     * 警告は 1 度だけ。毎秒吐くとログが埋まって本題が見えなくなる。
+     */
+    uint32_t open_ms;
+    bool     silent_warned;
 
     /* 停止要求 (シグナルハンドラから触るので volatile) */
     volatile int stop;
@@ -390,6 +458,10 @@ vm_err_t vm_modem_create(vm_modem_t **out, const vm_config_t *cfg)
     set_dcd(m, false);
     m->prev_dtr = vm_serial_get_dtr(m->ser);
 
+    /* 無音検出の起点。ここから 1 バイトも来なければ警告する (難所 12) */
+    m->open_ms       = vm_modem_now_ms();
+    m->silent_warned = false;
+
     *out = m;
     return VM_OK;
 }
@@ -681,6 +753,39 @@ static void check_dtr(vm_modem_t *m)
 }
 
 /* --------------------------------------------------------------------------
+ * 無音検出 (難所 12)
+ *
+ * COMMAND 状態のまま一定時間 1 バイトも受信しない = ホスト側が AT を
+ * 一切送っていない。この状態は「VIM1 側のログが待機のまま」「Windows XP
+ * だけ 692」という形で現れる。原因はホスト側フロー制御なので VIM1 側で
+ * 直せないが、事実と対処を名指しした 1 行があるかどうかで切り分け時間が
+ * 桁で変わる。だから警告だけは必ず出す。
+ * -------------------------------------------------------------------------- */
+static void warn_if_silent(vm_modem_t *m, uint32_t now)
+{
+    if (m->silent_warned) return;
+    if (m->stats.com_rx_bytes != 0) return;
+    if ((int32_t)(now - m->open_ms) < (int32_t)VM_MODEM_SILENT_WARN_MS) return;
+
+    m->silent_warned = true;
+
+    VM_LOGW("modem: %s を開いてから %u 秒、DTE から 1 バイトも受信していない",
+            vm_serial_name(m->ser), (unsigned)(VM_MODEM_SILENT_WARN_MS / 1000));
+    VM_LOGW("modem:   ホスト側が AT を送っていない可能性が高い "
+            "(こちらの受信経路の問題ではない)");
+    VM_LOGW("modem:   最有力: Windows のモデム定義がハードウェアフロー制御 "
+            "(RTS/CTS) を要求している");
+    VM_LOGW("modem:   CDC-ACM の SerialState 通知に CTS ビットは無く "
+            "(uapi/linux/usb/cdc.h)、f_acm は DSR|DCD しか上げない");
+    VM_LOGW("modem:   -> DCB の fOutxCtsFlow=1 だと送信が永久に保留され、"
+            "AT が 1 バイトも出ない -> RAS は 692 を返す");
+    VM_LOGW("modem:   対処: 「通信ケーブル経由の標準モデム」ではなく "
+            "windows/vim1modem-modem.inf を入れる (fOutxCtsFlow=0)");
+    VM_LOGW("modem:   暫定回避: モデムのプロパティ > 詳細設定 > 既定の "
+            "設定変更 > フロー制御 を「なし」にする");
+}
+
+/* --------------------------------------------------------------------------
  * 音響シーケンスの描画
  * -------------------------------------------------------------------------- */
 static bool render_sequence(vm_modem_t *m)
@@ -740,6 +845,7 @@ vm_err_t vm_modem_step(vm_modem_t *m)
          * ユーザのキー入力待ちであり、他に急ぐ仕事は無い。
          */
         pump_com(m, VM_MODEM_COM_BLOCK_MS, now);
+        warn_if_silent(m, now);
         break;
 
     /* ---------------------------------------------------------------- */
